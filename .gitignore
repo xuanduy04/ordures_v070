@@ -49,3 +49,7 @@ code_snapshots*/
 .claude/review-memory/
 tests/unit/unit_results.json
 tests/unit/unit_results/
+
+# opencode stuff
+.opencode/
+
