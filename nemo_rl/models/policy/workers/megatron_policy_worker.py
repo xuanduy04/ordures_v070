@@ -1,0 +1,2014 @@
+# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+import copy
+import gc
+import os
+import re
+import warnings
+from collections import defaultdict
+from contextlib import AbstractContextManager, contextmanager, nullcontext
+from typing import Any, Iterable, Iterator, Optional, TypeVar, cast
+
+import ray
+import torch
+from megatron.bridge.training.checkpointing import (
+    maybe_finalize_async_save,
+    save_checkpoint,
+)
+from megatron.bridge.training.utils.pg_utils import get_pg_collection
+from megatron.bridge.training.utils.train_utils import (
+    logical_and_across_model_parallel_group,
+    reduce_max_stat_across_model_parallel_group,
+)
+from megatron.bridge.utils.common_utils import get_rank_safe
+from megatron.core import parallel_state
+from megatron.core.distributed import DistributedDataParallel
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import (
+    FullyShardedDataParallel as custom_FSDP,
+)
+from megatron.core.optimizer import ChainedOptimizer
+from megatron.core.rerun_state_machine import get_rerun_state_machine
+from megatron.core.utils import get_model_config
+from transformers import PreTrainedTokenizerBase
+
+from nemo_rl.algorithms.logits_sampling_utils import TrainingSamplingParams
+from nemo_rl.algorithms.loss.interfaces import LossFunction
+from nemo_rl.data_plane.worker_mixin import TQWorkerMixin
+from nemo_rl.distributed.batched_data_dict import BatchedDataDict
+from nemo_rl.distributed.named_sharding import NamedSharding
+from nemo_rl.models.generation.interfaces import GenerationDatumSpec
+from nemo_rl.models.generation.megatron.megatron_worker import (
+    MegatronGenerationMixin,
+    MegatronGenerationRefitMixin,
+)
+from nemo_rl.models.generation.vllm.config import VllmConfig
+from nemo_rl.models.megatron.common import get_moe_metrics
+from nemo_rl.models.megatron.data import (
+    get_microbatch_iterator,
+    process_global_batch,
+)
+from nemo_rl.models.megatron.pipeline_parallel import (
+    broadcast_loss_metrics_from_last_stage,
+    broadcast_obj_from_pp_rank,
+    broadcast_tensors_from_last_stage,
+)
+from nemo_rl.models.megatron.router_replay import router_replay_enabled
+from nemo_rl.models.megatron.setup import (
+    finalize_megatron_setup,
+    handle_model_import,
+    setup_distributed,
+    setup_model_and_optimizer,
+    setup_reference_model_state,
+    validate_and_set_config,
+    validate_model_paths,
+)
+from nemo_rl.models.megatron.train import (
+    LogprobsPostProcessor,
+    LossPostProcessor,
+    TopkLogitsPostProcessor,
+    aggregate_training_statistics,
+    megatron_forward_backward,
+)
+from nemo_rl.models.policy import PolicyConfig
+from nemo_rl.models.policy.interfaces import (
+    ColocatablePolicyInterface,
+    LogprobOutputSpec,
+    ReferenceLogprobOutputSpec,
+)
+from nemo_rl.models.policy.utils import get_runtime_env_for_policy_worker
+from nemo_rl.models.policy.workers.base_policy_worker import AbstractPolicyWorker
+from nemo_rl.models.policy.workers.patches import apply_transformer_engine_patch
+from nemo_rl.utils.nsys import wrap_with_nvtx_name
+from nemo_rl.utils.nvml import log_gpu_memory_diagnostics
+from nemo_rl.utils.packed_tensor import packed_broadcast_producer
+from nemo_rl.utils.r3_trace import maybe_r3_trace_stage
+
+TokenizerType = TypeVar("TokenizerType", bound=PreTrainedTokenizerBase)
+
+
+def _should_use_router_replay(
+    *,
+    enabled: bool,
+    data: BatchedDataDict[Any],
+    stage: str,
+    require: bool,
+) -> bool:
+    if not enabled or not require:
+        return False
+    if "routed_experts" in data:
+        return True
+    raise RuntimeError(
+        "policy.router_replay.enabled=true requires routed_experts for "
+        f"{stage}, but the fetched batch does not contain that field. This "
+        "usually means the TQ schema, field selection, or rollout write path "
+        "stopped carrying routed_experts. Reference-logprob intentionally skips "
+        "routed_experts; prev-logprob and train must not."
+    )
+
+
+def _model_self_packs_for_cp(model: Any) -> bool:
+    """Whether the model packs sequences + CP-shards inside its own forward.
+
+    Such models (mbridge VLM wrappers) call ``preprocess_packed_seqs`` in their
+    forward, so NeMo-RL must hand them an unpacked ``[B, S]`` batch instead of
+    pre-packing + CP-sharding itself. The only such model today is mbridge's
+    Qwen3VL, which is also the only mbridge VLM that supports context
+    parallelism; classic mcore GPTModel and other VLMs do not self-pack.
+    """
+    from megatron.bridge.models.qwen_vl.modelling_qwen3_vl.model import Qwen3VLModel
+    from megatron.core.utils import unwrap_model
+
+    unwrapped = unwrap_model(model)
+    chunks = unwrapped if isinstance(unwrapped, (list, tuple)) else [unwrapped]
+    return any(isinstance(chunk, Qwen3VLModel) for chunk in chunks)
+
+
+# Classes with @ray.remote can't be inherited from, so we split the implementation out.
+# This is useful when using worker extension classes.
+class MegatronPolicyWorkerImpl(
+    MegatronGenerationMixin,
+    MegatronGenerationRefitMixin,
+    TQWorkerMixin,
+    AbstractPolicyWorker,
+    ColocatablePolicyInterface,
+):
+    def __repr__(self):
+        """Customizes the actor's prefix in the Ray logs.
+
+        This makes it easier to identify which worker is producing specific log messages.
+        """
+        if torch.distributed.is_initialized():
+            return f"{self.__class__.__qualname__}[rank={torch.distributed.get_rank()}]"
+        else:
+            return f"{self.__class__.__qualname__}"
+
+    def _local_coords(self) -> dict[str, int]:
+        if not torch.distributed.is_initialized():
+            return {}
+        return {
+            "tensor_parallel": parallel_state.get_tensor_model_parallel_rank(),
+            "context_parallel": parallel_state.get_context_parallel_rank(),
+            "pipeline_parallel": parallel_state.get_pipeline_model_parallel_rank(),
+        }
+
+    def _get_replica_group(self) -> Optional[Any]:
+        """Replica group = TP × CP × PP siblings within this DP rank.
+
+        Always returns the real group so :meth:`_is_replica_leader` (used
+        by both fetch and write-back) gives the correct single-writer
+        answer even at CP=1 — gating on CP=1 here is what produced the
+        ``-601 ILLEGAL_CLIENT`` duplicate-write bug. The fetch-path
+        broadcast-vs-independent perf choice lives inside ``_fetch``
+        keyed on ``replica_group.size()``.
+
+        mcore exposes per-axis groups (``get_tensor_model_parallel_group``,
+        ``get_context_parallel_group``, ``get_pipeline_model_parallel_group``)
+        but no single combined group. We build the combined NCCL group
+        once on first call by enumerating coordinates that share this
+        rank's ``dp_rank``.
+        """
+        if not torch.distributed.is_initialized():
+            return None
+        cached = getattr(self, "_replica_group_cache", "uninit")
+        if cached != "uninit":
+            return cached
+
+        world_size = torch.distributed.get_world_size()
+        my_dp_rank = parallel_state.get_data_parallel_rank()
+        # Collect global ranks that share this DP rank — they form the
+        # replica group. Done collectively so every rank ends up with
+        # the same ranks list and can pass it to new_group().
+        my_replica_ranks_t = torch.full(
+            (world_size,),
+            -1,
+            dtype=torch.long,
+            device="cuda",
+        )
+        my_replica_ranks_t[torch.distributed.get_rank()] = my_dp_rank
+        torch.distributed.all_reduce(
+            my_replica_ranks_t, op=torch.distributed.ReduceOp.MAX
+        )
+        all_dp_ranks = my_replica_ranks_t.tolist()
+
+        # Every (dp_rank → ranks) bucket must call new_group on its own
+        # ranks list, but new_group itself must be called collectively
+        # across the full world. Sort by dp_rank to keep call order
+        # consistent across processes.
+        groups: dict[int, Any] = {}
+        for dp in sorted(set(all_dp_ranks)):
+            ranks = [r for r, d in enumerate(all_dp_ranks) if d == dp]
+            grp = torch.distributed.new_group(ranks=ranks, backend="nccl")
+            groups[dp] = grp
+        self._replica_group_cache = groups[my_dp_rank]
+        return self._replica_group_cache
+
+    @staticmethod
+    def configure_worker(
+        num_gpus: int | float,
+        bundle_indices: Optional[tuple[int, list[int]]] = None,
+    ) -> tuple[dict[str, Any], dict[str, str], dict[str, Any], dict[str, Any]]:
+        """Worker-controlled Ray actor configuration.
+
+        Ensures that communication via NVLS functions correctly.
+
+        Args:
+            num_gpus: Original GPU allocation for this worker based on the placement group
+            bundle_indices: Tuple of (node_idx, local_bundle_indices) for this server
+
+        Returns:
+            tuple with complete worker configuration:
+              - 'resources': Resource allocation (e.g., num_gpus)
+              - 'env_vars': Environment variables for this worker
+              - 'init_kwargs': Parameters to pass to __init__ of the worker
+              - 'runtime_env': Additional runtime_env options (e.g., nsight config)
+        """
+        del bundle_indices  # one GPU per worker; no per-bundle seeding needed
+        resources: dict[str, Any] = {"num_gpus": num_gpus}
+        env_vars: dict[str, str] = {"RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1"}
+        init_kwargs: dict[str, Any] = {}
+        return resources, env_vars, init_kwargs, {}
+
+    def __init__(
+        self,
+        config: PolicyConfig,
+        tokenizer: TokenizerType,
+        weights_path: Optional[str] = None,
+        optimizer_path: Optional[str] = None,
+        init_optimizer: bool = True,
+        init_reference_model: bool = True,
+        *,
+        worker_sharding_annotations: NamedSharding,
+        **kwargs: Any,
+    ):
+        """Initialize the MegatronPolicyWorker."""
+        # NVML-based and guarded on torch.cuda.is_initialized(), so this does
+        # not initialize a CUDA context ahead of the set_device below.
+        log_gpu_memory_diagnostics(
+            label="init_start", worker_type="MegatronPolicyWorker"
+        )
+
+        # Must be the first CUDA-touching call in this process.
+        # With `RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1` (set by `configure_worker()`),
+        gpu_ids = ray.get_gpu_ids()
+        local_rank = int(gpu_ids[0])
+        os.environ["LOCAL_RANK"] = str(local_rank)
+        torch.cuda.set_device(local_rank)
+
+        # Apply patch from https://github.com/NVIDIA/TransformerEngine/pull/2286/files
+        apply_transformer_engine_patch()
+
+        from nemo_rl.distributed.numa_utils import bind_to_gpu_numa
+
+        # local_rank (== ray.get_gpu_ids()[0]) is the physical GPU index that
+        # keys the affinity file. Pass it explicitly: CUDA_VISIBLE_DEVICES lists
+        # all node devices here (RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1,
+        # set by configure_worker), so it can't identify this worker's GPU.
+        bind_to_gpu_numa(local_rank)
+
+        self.cfg = config
+        self._router_replay_enabled = router_replay_enabled(config)
+
+        # Set rank for non-collocated to check which ranks to broadcast from
+        self.rank = get_rank_safe()
+
+        # Step 1: Setup distributed
+        setup_distributed()
+        log_gpu_memory_diagnostics(
+            label="after_nccl_init", worker_type="MegatronPolicyWorker"
+        )
+
+        # Defensive assert to ensure to ensure `local_rank` setter worked correctly.
+        assert torch.cuda.current_device() == local_rank, (
+            f"device drift after setup_distributed: current_device="
+            f"{torch.cuda.current_device()}, LOCAL_RANK={local_rank}."
+        )
+
+        # Step 2: Validate and setup model paths
+        hf_model_name, pretrained_path, pt_checkpoint_exists = validate_model_paths(
+            config
+        )
+        # Handle model import if needed. Subclasses (e.g. ModelOpt quant
+        # worker) may set ``_model_import_post_wrap_hook`` and
+        # layer-spec hooks on ``self`` before calling
+        # super().__init__() to inject quantization hooks into HF->Megatron
+        # import.
+        handle_model_import(
+            config,
+            hf_model_name,
+            pretrained_path,
+            pt_checkpoint_exists,
+            model_post_wrap_hook=getattr(self, "_model_import_post_wrap_hook", None),
+            transformer_layer_spec=getattr(self, "_transformer_layer_spec", None),
+            mamba_stack_spec=getattr(self, "_mamba_stack_spec", None),
+        )
+        log_gpu_memory_diagnostics(
+            label="after_hf_import", worker_type="MegatronPolicyWorker"
+        )
+
+        # Store tokenizer
+        self.tokenizer = tokenizer
+        if self.tokenizer.pad_token is None:
+            self.tokenizer.pad_token = self.tokenizer.eos_token
+
+        # Step 3: Setup model configuration
+        # Training workers cannot use inference_optimized transformer spec.
+        if init_optimizer:
+            assert (
+                config["megatron_cfg"].get("transformer_impl") != "inference_optimized"
+            ), (
+                "transformer_impl=inference_optimized must not be set on training workers. "
+                "Use policy.generation.mcore_generation_config.transformer_impl=inference_optimized instead."
+            )
+        runtime_config = validate_and_set_config(
+            config,
+            self.rank,
+            hf_model_name,
+            pretrained_path,
+            weights_path,
+            optimizer_path,
+        )
+
+        self.megatron_cfg = runtime_config.megatron_cfg
+        self.dtype = runtime_config.dtype
+        self.optimizer_cpu_offload = runtime_config.optimizer_cpu_offload
+        self.offload_optimizer_for_logprob = (
+            runtime_config.offload_optimizer_for_logprob
+        )
+        self.is_generation_colocated = runtime_config.is_generation_colocated
+        self.final_padded_vocab_size = runtime_config.final_padded_vocab_size
+        self.sampling_params = runtime_config.sampling_params
+
+        self.defer_fp32_logits = self.cfg["megatron_cfg"].get(
+            "defer_fp32_logits", None
+        ) and (runtime_config.model_cfg.fp16 or runtime_config.model_cfg.bf16)
+
+        # Store FP8 config for later use
+        self.fp8_cfg = config["megatron_cfg"].get("fp8_cfg", None)
+
+        # Full-iteration CUDA graphs cannot be interrupted, so disable the
+        # NaN-in-loss check that would otherwise require breaking out of the graph.
+        if self.megatron_cfg.model.cuda_graph_impl == "full_iteration":
+            warnings.warn(
+                "Disabling check_for_nan_in_loss: full-iteration CUDA graph cannot be interrupted."
+            )
+            self.megatron_cfg.rerun_state_machine.check_for_nan_in_loss = False
+
+        # Validate configuration
+        self.megatron_cfg.validate()
+
+        # Step 4: Setup Megatron model and components
+        model_and_optimizer_state = setup_model_and_optimizer(
+            config,
+            self.megatron_cfg,
+            init_optimizer,
+            pre_load_checkpoint_hook=getattr(self, "_pre_load_checkpoint_hook", None),
+        )
+
+        self.mcore_state = model_and_optimizer_state.state
+        self.model = model_and_optimizer_state.model
+        self.optimizer = model_and_optimizer_state.optimizer
+        self.scheduler = model_and_optimizer_state.scheduler
+        self.checkpointing_context = model_and_optimizer_state.checkpointing_context
+        param_sync_func = model_and_optimizer_state.param_sync_func
+        self.draft_model = model_and_optimizer_state.draft_model
+        log_gpu_memory_diagnostics(
+            label="after_model_setup", worker_type="MegatronPolicyWorker"
+        )
+
+        # Set the param sync function for the model if needed
+        if param_sync_func is not None:
+            get_model_config(self.model).param_sync_func = param_sync_func
+
+        # Step 5: Setup reference model if needed
+        if init_reference_model:
+            self.model = self.move_model(self.model, "cpu")
+            self.reference_state_dict = setup_reference_model_state(
+                config,
+                self.megatron_cfg,
+                pretrained_path,
+                pre_load_checkpoint_hook=getattr(
+                    self, "_pre_load_checkpoint_hook", None
+                ),
+            )
+            self.model = self.move_model(self.model, "cuda")
+            log_gpu_memory_diagnostics(
+                label="after_ref_model", worker_type="MegatronPolicyWorker"
+            )
+
+        # Step 6: Finalize setup
+        (
+            self.megatron_tokenizer,
+            self.megatron_bridge,
+            self.should_disable_forward_pre_hook,
+            self.dp_size,
+        ) = finalize_megatron_setup(
+            config,
+            self.megatron_cfg,
+            hf_model_name,
+            worker_sharding_annotations,
+            self.model,
+            self.optimizer,
+        )
+        self._first_train_step_forward_pre_hook_disabled = False
+        self._first_train_step_param_sync_func = None
+        if self.should_disable_forward_pre_hook and self._forward_pre_hook_enabled():
+            self._disable_forward_pre_hook_until_next_train_step()
+
+        # Whether the model packs sequences + CP-shards inside its own forward
+        # (mbridge VLM wrappers like Qwen3VL). If so, NeMo-RL must hand it an
+        # unpacked [B, S] batch rather than pre-packing + CP-sharding itself.
+        self.delegate_pack_to_model = _model_self_packs_for_cp(self.model)
+
+        # vars used for refit
+        ## will be initialized in prepare_refit_info
+        # refit_param_info_mcore combines the conversion tasks with the param memory
+        # [(mcore_param_name, estimated_memory), ...]
+        # Note: here param name is local param name, with local layer number and
+        # local expert id etc.
+        self.refit_conversion_tasks = None
+        self.refit_conversion_tasks_current_index = None
+        self.refit_param_info_mcore = None
+
+        ## used for streaming update inference engine weights
+        self._held_gather_buffer = None
+
+        self._init_inference_engine_state()
+
+        log_gpu_memory_diagnostics(
+            label="init_complete", worker_type="MegatronPolicyWorker"
+        )
+
+    def enable_forward_pre_hook(self):
+        assert isinstance(self.model, DistributedDataParallel)
+        if not self._forward_pre_hook_enabled():
+            self.model.enable_forward_pre_hook()
+
+    def disable_forward_pre_hook(self, param_sync=True):
+        assert isinstance(self.model, DistributedDataParallel)
+        if not self._forward_pre_hook_enabled():
+            return
+        if param_sync:
+            self._copy_main_params_to_param_buffer(zero_grad_buffer=True)
+        self.model.disable_forward_pre_hook(param_sync=param_sync)
+
+    def _forward_pre_hook_enabled(self) -> bool:
+        if not isinstance(self.model, DistributedDataParallel):
+            return False
+        return len(getattr(self.model, "remove_forward_pre_hook_handles", {})) > 0
+
+    def _disable_forward_pre_hook_until_next_train_step(self) -> None:
+        assert isinstance(self.model, DistributedDataParallel)
+        if self._forward_pre_hook_enabled():
+            self.disable_forward_pre_hook(param_sync=False)
+        model_config = get_model_config(self.model)
+        self._first_train_step_param_sync_func = model_config.param_sync_func
+        model_config.param_sync_func = None
+        self._first_train_step_forward_pre_hook_disabled = True
+
+    def _copy_main_params_to_param_buffer(self, zero_grad_buffer: bool = False) -> None:
+        if not isinstance(self.model, DistributedDataParallel):
+            return
+
+        if not self._uses_mxfp8_overlap_shared_param_buffer():
+            return
+
+        if not self._forward_pre_hook_enabled():
+            return
+
+        if zero_grad_buffer:
+            self.model.zero_grad_buffer()
+
+        optimizers = (
+            self.optimizer.chained_optimizers
+            if isinstance(self.optimizer, ChainedOptimizer)
+            else [self.optimizer]
+        )
+        for optim_instance in optimizers:
+            if hasattr(optim_instance, "_copy_main_params_to_param_buffer"):
+                optim_instance._copy_main_params_to_param_buffer()
+
+    def _uses_mxfp8_overlap_shared_param_buffer(self) -> bool:
+        return getattr(
+            self.megatron_cfg.optimizer, "reuse_grad_buf_for_mxfp8_param_ag", False
+        ) and getattr(self.megatron_cfg.ddp, "overlap_param_gather", False)
+
+    def _get_model_extra_state_dict(self) -> dict[str, Any]:
+        fp8_enabled = self.fp8_cfg and self.fp8_cfg.get("enabled", False)
+        if not fp8_enabled:
+            return {}
+        extra_state = {}
+        for key, value in self.model.state_dict().items():
+            if "._extra_state" not in key:
+                continue
+            if isinstance(value, torch.Tensor):
+                extra_state[key] = value.detach().clone()
+            else:
+                extra_state[key] = copy.deepcopy(value)
+        return extra_state
+
+    def _restore_model_extra_state_dict(self, extra_state: dict[str, Any]) -> None:
+        if not extra_state:
+            return
+        self.model.load_state_dict(extra_state, strict=False)
+
+    @wrap_with_nvtx_name("megatron_policy_worker/train")
+    def train(
+        self,
+        data: BatchedDataDict,
+        loss_fn: LossFunction,
+        eval_mode: bool = False,
+        gbs: Optional[int] = None,
+        mbs: Optional[int] = None,
+        check_dim_skip_keys: Optional[Iterable[str]] = None,
+    ) -> dict[str, Any]:
+        """Train the policy on a batch of data with a given loss function.
+
+        ``check_dim_skip_keys`` is accepted for parity with the v1/v2 DTensor
+        workers (cross-tokenizer ride-along tensors whose dim 1 is not the
+        student sequence axis). Megatron doesn't run cross-tokenizer, so it
+        must be None.
+        """
+        assert check_dim_skip_keys is None, (
+            "check_dim_skip_keys is only supported by the v2 DTensor worker; "
+            "Megatron does not run cross-tokenizer distillation."
+        )
+        # Note: zero_grad_buffer is called at the start of each global batch iteration
+        # in the loop below, so we don't need to call it here.
+        if hasattr(self.model, "inference_params"):
+            self.model.inference_params = None
+
+        # Reset any cached attention states
+        for module in self.model.modules():
+            if hasattr(module, "reset_inference_cache"):
+                module.reset_inference_cache()
+            if hasattr(module, "_inference_key_value_memory"):
+                module._inference_key_value_memory = None
+
+        if gbs is None:
+            gbs = self.cfg["train_global_batch_size"]
+        if mbs is None:
+            mbs = self.cfg["train_micro_batch_size"]
+        local_gbs = gbs // self.dp_size
+        total_dataset_size = torch.tensor(data.size, device="cuda")
+        torch.distributed.all_reduce(
+            total_dataset_size,
+            op=torch.distributed.ReduceOp.SUM,
+            group=parallel_state.get_data_parallel_group(),
+        )
+        num_global_batches = int(total_dataset_size.item()) // gbs
+
+        if eval_mode:
+            ctx: AbstractContextManager[Any] = torch.no_grad()
+            self.model.eval()
+            saved_extra_state = self._get_model_extra_state_dict()
+            reenable_forward_pre_hook_after_eval = (
+                self.should_disable_forward_pre_hook
+                and self._forward_pre_hook_enabled()
+            )
+            if reenable_forward_pre_hook_after_eval:
+                self.disable_forward_pre_hook()
+        else:
+            ctx = nullcontext()
+            # Ensure model is in training mode
+            self.model.train()
+            saved_extra_state = None
+            reenable_forward_pre_hook_after_eval = False
+
+        with ctx:
+            all_mb_metrics = []
+            losses = []
+            total_num_microbatches = 0
+            for gb_idx in range(num_global_batches):
+                gb_result = process_global_batch(
+                    data,
+                    loss_fn=loss_fn,
+                    dp_group=parallel_state.get_data_parallel_group(),
+                    batch_idx=gb_idx,
+                    batch_size=local_gbs,
+                )
+                batch = gb_result["batch"]
+                global_valid_seqs = gb_result["global_valid_seqs"]
+                global_valid_toks = gb_result["global_valid_toks"]
+
+                # Pre-compute the MTP loss mask, only when MTP is enabled, so
+                # process_microbatch can pack it.
+                model_config = self._get_model_config()
+                mtp_num_layers = getattr(model_config, "mtp_num_layers", None)
+                mtp_enabled = mtp_num_layers is not None and mtp_num_layers > 0
+                if mtp_enabled and "token_mask" in batch and "sample_mask" in batch:
+                    mtp_loss_mask = batch["token_mask"] * batch[
+                        "sample_mask"
+                    ].unsqueeze(-1)
+                    batch["mtp_loss_mask"] = mtp_loss_mask
+
+                (
+                    data_iterator,
+                    num_microbatches,
+                    micro_batch_size,
+                    seq_length,
+                    padded_seq_length,
+                ) = get_microbatch_iterator(
+                    batch,
+                    self.cfg,
+                    mbs,
+                    straggler_timer=self.mcore_state.straggler_timer,
+                    delegate_pack_to_model=self.delegate_pack_to_model,
+                )
+                # Track total microbatches for MoE aux-loss averaging
+                total_num_microbatches += int(num_microbatches)
+
+                loss_post_processor = LossPostProcessor(
+                    loss_fn=loss_fn,
+                    cfg=self.cfg,
+                    num_microbatches=num_microbatches,
+                    sampling_params=self.sampling_params,
+                    draft_model=self.draft_model,
+                )
+
+                rerun_state_machine = get_rerun_state_machine()
+                while rerun_state_machine.should_run_forward_backward(data_iterator):
+                    # Set grad to zero. For MXFP8 overlap eval, the param and
+                    # grad buffers are shared and pre-hooks are disabled above.
+                    # Avoid zeroing the shared param buffer before forward-only eval.
+                    if not (
+                        eval_mode and self._uses_mxfp8_overlap_shared_param_buffer()
+                    ):
+                        self.model.zero_grad_buffer()
+                        self.optimizer.zero_grad()
+                        self._copy_main_params_to_param_buffer()
+
+                    # Set moe_grad_scale_func for MoE aux-loss gradient scaling.
+                    # With calculate_per_token_loss=True, the router pre-multiplies
+                    # the aux loss by (num_local_tokens * tp_cp_group.size()), and
+                    # MoEAuxLossAutoScaler applies loss_scale to the gradient. Setting
+                    # loss_scale = 1/global_valid_toks (G = global valid token count)
+                    # normalizes the aux gradient consistently with the main per-token
+                    # SFT loss:
+                    #   (1/G) * N_local * tp_cp_size * aux_grad -> DDP SUM -> aux_grad / G
+                    self._set_moe_grad_scale_func(  # pragma: no cover
+                        self._compute_moe_grad_scale(global_valid_toks)
+                    )
+                    # Set mtp_grad_scale_func for MTP loss scaling (scales by valid tokens)
+                    mtp_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+                    self._set_mtp_grad_scale_func(lambda: mtp_scale)
+
+                    # Forward pass.
+                    draft_enabled = "draft" in self.cfg and self.cfg["draft"]["enabled"]
+                    use_router_replay = _should_use_router_replay(
+                        enabled=self._router_replay_enabled,
+                        data=batch,
+                        stage="train",
+                        require=True,
+                    )
+                    with maybe_r3_trace_stage("train", enabled=use_router_replay):
+                        losses_reduced = megatron_forward_backward(
+                            model=self.model,
+                            data_iterator=data_iterator,
+                            num_microbatches=num_microbatches,
+                            seq_length=padded_seq_length,
+                            mbs=micro_batch_size,
+                            post_processing_fn=loss_post_processor,
+                            forward_only=eval_mode,
+                            defer_fp32_logits=self.defer_fp32_logits,
+                            global_valid_seqs=global_valid_seqs,
+                            global_valid_toks=global_valid_toks,
+                            sampling_params=self.sampling_params,
+                            straggler_timer=self.mcore_state.straggler_timer,
+                            draft_model=self.draft_model,
+                            enable_hidden_capture=draft_enabled,
+                            use_linear_ce_fusion_loss=self.cfg["megatron_cfg"].get(
+                                "use_linear_ce_fusion_loss", False
+                            ),
+                            use_router_replay=use_router_replay,
+                            router_replay_train=not eval_mode,
+                        )
+
+                # Clear mtp_grad_scale_func after the forward-backward pass so
+                # it doesn't get serialized in the run_config.yaml when saving
+                self._set_mtp_grad_scale_func(None)
+
+                # Clear moe_grad_scale_func after the forward-backward pass
+                self._set_moe_grad_scale_func(None)  # pragma: no cover
+
+                # Empty unused memory.
+                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                    torch.cuda.empty_cache()
+
+                # Update parameters.
+                if not eval_mode:
+                    update_successful, grad_norm, num_zeros_in_grad = (
+                        self.optimizer.step()
+                    )
+                    # Megatron-LM PR #4116 replaced the optimizer.mtp_grad_norm attribute
+                    # with a per-group dict populated during gradient clipping. Value is
+                    # None when clip_grad == 0 or this rank owns no MTP-tagged params
+                    # (MTP params are tagged only when mtp_detach_heads=True, on the last
+                    # pipeline stage). grad_norms_by_group always exists after step().
+                    mtp_grad_norm = self.optimizer.grad_norms_by_group.get("mtp")
+                else:
+                    update_successful, grad_norm, num_zeros_in_grad = (True, 0.0, 0.0)
+                    mtp_grad_norm = None
+
+                pg_collection = get_pg_collection(self.model)
+
+                # when freezing sub-models we may have a mixture of successful and unsucessful ranks,
+                # so we must gather across mp ranks
+                update_successful = logical_and_across_model_parallel_group(
+                    update_successful, mp_group=pg_collection.mp
+                )
+                # grad_norm and num_zeros_in_grad will be None on ranks without trainable params,
+                # so we must gather across mp ranks
+                grad_norm: float = reduce_max_stat_across_model_parallel_group(
+                    grad_norm, mp_group=pg_collection.mp
+                )
+                num_zeros_in_grad: float = reduce_max_stat_across_model_parallel_group(
+                    num_zeros_in_grad, mp_group=pg_collection.mp
+                )
+                # Max-reduce across the model-parallel group so every rank (including
+                # non-last-PP-stage ranks, where it is None) has the MTP grad norm.
+                mtp_grad_norm = reduce_max_stat_across_model_parallel_group(
+                    mtp_grad_norm, mp_group=pg_collection.mp
+                )
+                if (
+                    not eval_mode
+                    and self._first_train_step_forward_pre_hook_disabled
+                    and update_successful
+                ):
+                    self.enable_forward_pre_hook()
+                    get_model_config(
+                        self.model
+                    ).param_sync_func = self._first_train_step_param_sync_func
+                    self._first_train_step_param_sync_func = None
+                    self._first_train_step_forward_pre_hook_disabled = False
+
+                # Empty unused memory.
+                if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 2:
+                    torch.cuda.empty_cache()
+
+                if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                    # keep all microbatch metrics to be normalized later
+                    gb_loss_metrics = []
+                    mb_losses = []
+                    for x in losses_reduced:
+                        loss_metrics = {}
+                        for k in x.keys():
+                            if "_min" in k or "_max" in k:
+                                loss_metrics[k] = x[k]
+                            else:
+                                loss_metrics[k] = x[k] / num_global_batches
+                        gb_loss_metrics.append(loss_metrics)
+                        curr_lr = self.scheduler.get_lr(self.optimizer.param_groups[0])
+                        curr_wd = self.scheduler.get_wd()
+                        loss_metrics["lr"] = curr_lr
+                        loss_metrics["wd"] = curr_wd
+                        loss_metrics["global_valid_seqs"] = global_valid_seqs.item()
+                        loss_metrics["global_valid_toks"] = global_valid_toks.item()
+                        mb_losses.append(loss_metrics["loss"])
+
+                else:
+                    gb_loss_metrics = None
+
+                # Broadcast loss metrics from last stage to all stages
+                gb_loss_metrics = broadcast_loss_metrics_from_last_stage(
+                    gb_loss_metrics
+                )
+                if not parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+                    mb_losses = [x["loss"] for x in gb_loss_metrics]
+
+                all_mb_metrics.extend(gb_loss_metrics)
+                losses.append(torch.tensor(mb_losses).sum().item())
+
+        if saved_extra_state is not None:
+            self._restore_model_extra_state_dict(saved_extra_state)
+        if reenable_forward_pre_hook_after_eval:
+            # A forced param sync leaves the next training step with no pending
+            # param AG to finish. Keep hooks disabled for that one step so grad
+            # accumulation starts from a clean shared param/grad buffer.
+            self._disable_forward_pre_hook_until_next_train_step()
+
+        if not eval_mode:
+            # Step LR scheduler once per train() call, not per global batch.
+            # Megatron's OptimizerParamScheduler.step takes an `increment` in
+            # samples: NeMo init scales lr_warmup_steps by gbs internally, so
+            # passing increment=gbs cancels that scaling and one tick == one
+            # train() call regardless of batch size.
+            self.scheduler.step(increment=gbs)
+
+        # Aggregate metrics across all microbatches
+        mb_metrics, global_loss = aggregate_training_statistics(
+            all_mb_metrics=all_mb_metrics,
+            losses=losses,
+            data_parallel_group=parallel_state.get_data_parallel_group(),
+        )
+
+        metrics = {
+            "global_loss": global_loss.cpu(),
+            "rank": torch.distributed.get_rank(),
+            "gpu_name": torch.cuda.get_device_name(),
+            "model_dtype": self.dtype,
+            "all_mb_metrics": mb_metrics,
+            "grad_norm": torch.tensor([grad_norm]),
+        }
+        # Read "config" via getattr-by-string so the token stays out of
+        # train.__code__.co_names; with torch 2.11 cloudpickle otherwise
+        # matches torch.distributed.config (a non-pickleable ConfigModuleInstance).
+        model_config = getattr(self.model, "config", None)
+        num_moe_experts = getattr(model_config, "num_moe_experts", None)
+        if num_moe_experts is not None and num_moe_experts > 1:
+            moe_loss_scale = 1.0 / max(1, total_num_microbatches)
+            moe_metrics = get_moe_metrics(
+                loss_scale=moe_loss_scale,
+                per_layer_logging=self.cfg["megatron_cfg"]["moe_per_layer_logging"],
+            )
+            if moe_metrics:
+                metrics["moe_metrics"] = moe_metrics
+        # Collect MTP metrics (kept out of train()'s body so cloudpickle does not
+        # pull an unpicklable torch ConfigModuleInstance into the worker actor).
+        self._collect_mtp_metrics(metrics, total_num_microbatches, mtp_grad_norm)
+        return metrics
+
+    def _compute_moe_grad_scale(self, global_valid_toks):
+        """Build a moe_grad_scale_func that normalizes the aux-loss gradient.
+
+        Returns a callable yielding loss_scale = 1/global_valid_toks (clamped to
+        avoid division by zero) so the MoE aux gradient is normalized consistently
+        with the main per-token SFT loss. See the call site in train() for the
+        full derivation.
+        """
+        moe_scale = 1.0 / global_valid_toks.clamp(min=1).float()
+        return lambda: moe_scale
+
+    def _set_moe_grad_scale_func(self, func):
+        """Set moe_grad_scale_func on the model config for MOE aux loss scaling."""
+        config = self._get_model_config()
+        if config is not None:
+            config.moe_grad_scale_func = func
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_reference_policy_logprobs")
+    def get_reference_policy_logprobs(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+    ) -> BatchedDataDict[ReferenceLogprobOutputSpec]:
+        with self.use_reference_model():
+            reference_logprobs = self.get_logprobs(
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
+            )
+
+        return_data = BatchedDataDict[ReferenceLogprobOutputSpec]()
+        return_data["reference_logprobs"] = reference_logprobs["logprobs"].cpu()
+        return return_data
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_logprobs")
+    def get_logprobs(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        require_router_replay: bool = True,
+    ) -> BatchedDataDict[LogprobOutputSpec]:
+        """Get the logprobs of the model for a batch of data.
+
+        Uses the configured logprob_batch_size to do microbatching.
+        Input data is assumed to be right-padded. The method internally converts to
+        left-padded format for computation, and returns outputs in right-padded format.
+        If micro_batch_size is provided, it will be used instead of the configured
+        logprob_batch_size.
+
+        Returns:
+          a BatchedDataDict with key "logprobs" and shape [batch_size, sequence_length].
+          We use the convention that the logprob of the first token is 0 so that the sequence length is maintained.
+          The logprob of input token i is specified at position i in the output logprobs tensor.
+        """
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        self.model.eval()
+
+        (
+            mb_iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+        )
+
+        use_linear_ce_fusion = self.cfg["megatron_cfg"].get(
+            "use_linear_ce_fusion_loss", False
+        )
+        logprobs_post_processor = LogprobsPostProcessor(
+            cfg=self.cfg,
+            sampling_params=self.sampling_params,
+            use_linear_ce_fusion=use_linear_ce_fusion,
+        )
+        use_router_replay = _should_use_router_replay(
+            enabled=self._router_replay_enabled,
+            data=data,
+            stage="prev-logprob",
+            require=require_router_replay,
+        )
+
+        with maybe_r3_trace_stage("prev-logprob", enabled=use_router_replay):
+            list_of_logprobs = megatron_forward_backward(
+                model=self.model,
+                data_iterator=mb_iterator,
+                seq_length=padded_seq_length,
+                mbs=micro_batch_size,
+                num_microbatches=num_microbatches,
+                post_processing_fn=logprobs_post_processor,
+                forward_only=True,
+                defer_fp32_logits=self.defer_fp32_logits,
+                sampling_params=self.sampling_params,
+                straggler_timer=self.mcore_state.straggler_timer,
+                use_linear_ce_fusion_loss=use_linear_ce_fusion,
+                use_router_replay=use_router_replay,
+                router_replay_train=False,
+            )
+
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            all_log_probs_padded = []
+            all_logprobs = [l["logprobs"] for l in list_of_logprobs]
+            for lp in all_logprobs:
+                padding_needed = seq_length - lp.shape[1]
+                if padding_needed > 0:
+                    lp = torch.nn.functional.pad(
+                        lp, (0, padding_needed), mode="constant", value=0.0
+                    )
+                all_log_probs_padded.append(lp)
+
+            logprobs = torch.cat(all_log_probs_padded, dim=0)
+            tensors = {"logprobs": logprobs}
+        else:
+            tensors = {"logprobs": None}
+        logprobs = broadcast_tensors_from_last_stage(tensors)["logprobs"]
+
+        no_grad.__exit__(None, None, None)
+        return BatchedDataDict[LogprobOutputSpec](logprobs=logprobs).to("cpu")
+
+    def _apply_state_dict_to_model(
+        self,
+        source_state_dict: dict,
+        *,
+        raise_if_key_missing: bool = False,
+    ) -> None:
+        """Apply a state dict to self.model in-place.
+
+        - Tensors with matching shape: in-place copy (parameters / buffers).
+        - _extra_state keys (e.g. FP8 scale/amax) with shape mismatch or non-Tensor value:
+          resolve the submodule and call set_extra_state(); supports DDP and Float16Module unwrap.
+
+        Args:
+            source_state_dict: State dict to apply (e.g. reference_state_dict or saved model_state_dict).
+            raise_if_key_missing: If True, raise when a key in self.model.state_dict() is missing
+                from source_state_dict; if False, skip such keys.
+        """
+        for state_dict_key, param_or_buf in self.model.state_dict().items():
+            if (
+                not isinstance(param_or_buf, torch.Tensor)
+                or "draft_model." in state_dict_key
+            ):
+                continue
+            if state_dict_key not in source_state_dict:
+                if raise_if_key_missing:
+                    raise ValueError(
+                        f"Key '{state_dict_key}' not in source state_dict."
+                    )
+                continue
+            source_value = source_state_dict[state_dict_key]
+
+            # Case 1: Same shape → in-place copy (parameters / buffers)
+            if (
+                isinstance(source_value, torch.Tensor)
+                and param_or_buf.shape == source_value.shape
+            ):
+                param_or_buf.copy_(source_value)
+                continue
+
+            # Case 2: _extra_state (shape mismatch or non-Tensor) → set_extra_state()
+            assert "extra_state" in state_dict_key, (
+                f"the {state_dict_key} is not an extra_state, but the param_or_buf is mismatched with the reference_state_dict {source_value.shape} != {param_or_buf.shape}."
+            )
+
+            submodule_path = state_dict_key.rsplit("._extra_state", 1)[0]
+            base_module = getattr(self.model, "module", self.model)
+            # Unwrap Float16Module/MoEFloat16Module: state_dict keys are relative to inner .module
+            top_level_name = submodule_path.split(".", 1)[0]
+            if not hasattr(base_module, top_level_name):
+                base_module = getattr(base_module, "module", base_module)
+            target_module = base_module.get_submodule(submodule_path)
+            target_module.set_extra_state(source_value)
+
+    @contextmanager
+    def use_reference_model(self):
+        """Context manager that temporarily swaps the reference model and active model.
+
+        On entry: Moves model to CPU, moves reference_model to CUDA. Swaps the references.
+                  Also disables top-k/top-p filtering since the reference policy's distribution
+                  is different from the current policy, making filtered logprobs incompatible.
+        On exit: Restores original references and re-flips cuda/cpu, restores sampling_params.
+        """
+        ## disable overlap param gather when swapping weights
+        if self.should_disable_forward_pre_hook:
+            self.disable_forward_pre_hook()
+
+        with torch.no_grad():
+            # Save original references
+            model_state_dict = {}
+            for name, item in self.model.state_dict().items():
+                if isinstance(item, torch.Tensor):
+                    item = item.detach().to(device="cpu", non_blocking=True, copy=True)
+                model_state_dict[name] = item
+
+            # Swap reference state into self.model. Use _apply_state_dict_to_model
+            # (rather than load_state_dict) so FP8 _extra_state with mismatched shape
+            # is routed through set_extra_state() correctly.
+            self._apply_state_dict_to_model(
+                self.reference_state_dict,
+                raise_if_key_missing=True,
+            )
+
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            # Temporarily disable top-k/top-p filtering for reference policy logprobs.
+            # The reference policy has different weights, so its top-k/top-p set is
+            # inherently different from the current policy. Using filtered logprobs
+            # would cause -inf mismatches that cannot be resolved by masking.
+            # Note: We keep temperature scaling since it was applied to prev_logprobs.
+            saved_sampling_params = self.sampling_params
+            if saved_sampling_params is not None:
+                self.sampling_params = TrainingSamplingParams(
+                    top_k=None,
+                    top_p=1.0,
+                    temperature=saved_sampling_params.temperature,
+                )
+            else:
+                self.sampling_params = None
+
+            # - self.model is the original reference_model, now on CUDA
+            # - self.reference_model is the original model, now on CPU
+            yield
+
+            # Restore sampling_params
+            self.sampling_params = saved_sampling_params
+
+            # Restore original policy state (weights + FP8 extra_state) from saved model_state_dict
+            self._apply_state_dict_to_model(
+                model_state_dict,
+                raise_if_key_missing=True,
+            )
+
+            if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            ## re-enable overlap param gather after weight swap
+            if self.should_disable_forward_pre_hook:
+                self.enable_forward_pre_hook()
+
+    @wrap_with_nvtx_name("megatron_policy_worker/get_topk_logits")
+    def get_topk_logits(
+        self,
+        *,
+        data: BatchedDataDict[GenerationDatumSpec],
+        k: int,
+        micro_batch_size: Optional[int] = None,
+    ):
+        """Get the top-k logits and indices for a batch of data.
+
+        The major difference from get_logprobs is that we compute top-k logits and indices for each position in the sequence.
+
+        Returns:
+            BatchedDataDict containing:
+                - topk_logits: Tensor of top-k logits for each position in the sequence
+                - topk_indices: Tensor of top-k indices for each position in the sequence
+        """
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+
+        logprob_batch_size = (
+            micro_batch_size
+            if micro_batch_size is not None
+            else self.cfg["logprob_batch_size"]
+        )
+
+        self.model.eval()
+
+        (
+            mb_iterator,
+            num_microbatches,
+            micro_batch_size,
+            seq_length,
+            padded_seq_length,
+        ) = get_microbatch_iterator(
+            data,
+            self.cfg,
+            logprob_batch_size,
+            straggler_timer=self.mcore_state.straggler_timer,
+            delegate_pack_to_model=self.delegate_pack_to_model,
+        )
+
+        list_of_outputs = megatron_forward_backward(
+            model=self.model,
+            data_iterator=mb_iterator,
+            seq_length=padded_seq_length,
+            mbs=micro_batch_size,
+            num_microbatches=num_microbatches,
+            post_processing_fn=TopkLogitsPostProcessor(cfg=self.cfg, k=k),
+            forward_only=True,
+            defer_fp32_logits=self.defer_fp32_logits,
+            sampling_params=self.sampling_params,
+            straggler_timer=self.mcore_state.straggler_timer,
+        )
+
+        if parallel_state.is_pipeline_last_stage(ignore_virtual=True):
+            logits_chunks = []
+            indices_chunks = []
+            for out in list_of_outputs:
+                tk = out["topk_logits"]
+                ti = out["topk_indices"]
+                pad_len = seq_length - tk.shape[1]
+                if pad_len > 0:
+                    tk = torch.nn.functional.pad(tk, (0, 0, 0, pad_len), value=0.0)
+                    ti = torch.nn.functional.pad(ti, (0, 0, 0, pad_len), value=0)
+                logits_chunks.append(tk)
+                indices_chunks.append(ti)
+
+            topk_logits = torch.cat(logits_chunks, dim=0)
+            topk_indices = torch.cat(indices_chunks, dim=0)
+
+            tensors_to_broadcast = {
+                "topk_logits": topk_logits,
+                "topk_indices": topk_indices,
+            }
+        else:
+            tensors_to_broadcast = {
+                "topk_logits": None,
+                "topk_indices": None,
+            }
+
+        # Broadcast tensors from last stage to all stages
+        broadcasted = broadcast_tensors_from_last_stage(tensors_to_broadcast)
+        topk_logits = broadcasted["topk_logits"]
+        topk_indices = broadcasted["topk_indices"]
+
+        no_grad.__exit__(None, None, None)
+        return BatchedDataDict.from_batches(
+            [{"topk_logits": topk_logits.cpu(), "topk_indices": topk_indices.cpu()}]
+        )
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/prepare_refit_info")
+    def prepare_refit_info(self) -> None:
+        """Prepare state dict metadata for weight refitting and IPC streaming."""
+        self.refit_param_info_mcore = self._calculate_refit_param_info()
+
+        # Collect tensor metadata for refit / hf side info
+        refit_param_info_hf = {}
+        # Reuse shared iterator that appends FP8 KV/Q scales when enabled
+        for name, tensor in self._iter_params_with_optional_kv_scales():
+            refit_param_info_hf[name] = (tensor.shape, tensor.dtype)
+
+        return refit_param_info_hf
+
+    def _collect_mtp_metrics(
+        self,
+        metrics: dict[str, Any],
+        total_num_microbatches: int,
+        mtp_grad_norm: Optional[float],
+    ) -> None:
+        """Add Multi-Token Prediction metrics to ``metrics`` when MTP is enabled.
+
+        get_mtp_metrics is imported lazily (not a module global) so cloudpickle
+        does not pull an unpicklable torch ConfigModuleInstance into the worker
+        actor's serialization.
+
+        Args:
+            metrics: Metrics dict to populate with MTP metrics (under "mtp_metrics").
+            total_num_microbatches: Microbatches accumulated this step. The MTP loss
+                logging helper sums the per-microbatch loss without dividing, so we pass
+                1/total_num_microbatches to recover the mean (mirroring the MoE path).
+            mtp_grad_norm: The MTP parameter group's gradient norm, already reduced across
+                the model-parallel group, or None when unavailable (e.g. clip_grad == 0 or
+                mtp_detach_heads=False). Logged under "mtp_metrics" as "grad_norm".
+        """
+        mtp_num_layers = getattr(self.model.config, "mtp_num_layers", None)
+        if mtp_num_layers is not None and mtp_num_layers > 0:
+            from nemo_rl.models.megatron.common import get_mtp_metrics
+
+            # MTP layers live only on the last pipeline stage, so the tracker is
+            # populated there alone. Broadcast to all stages so downstream metric
+            # aggregation (which reads rank 0's results) sees them when PP > 1.
+            mtp_loss_scale = 1.0 / max(1, total_num_microbatches)
+            mtp_metrics = get_mtp_metrics(loss_scale=mtp_loss_scale)
+            mtp_metrics = broadcast_loss_metrics_from_last_stage(mtp_metrics)
+            # mtp_grad_norm is already MP-reduced (same value on every rank); expose it
+            # under the "mtp/" namespace so it logs as train/mtp/grad_norm.
+            if mtp_grad_norm is not None:
+                mtp_metrics["grad_norm"] = float(mtp_grad_norm)
+            if mtp_metrics:
+                metrics["mtp_metrics"] = mtp_metrics
+
+    def _set_mtp_grad_scale_func(self, func):
+        """Set mtp_grad_scale_func on the model config for MTP loss scaling."""
+        config = self._get_model_config()
+        if config is not None:
+            config.mtp_grad_scale_func = func
+
+    def _get_model_config(self):
+        """Get the underlying model config (handle Float16Module wrapper)."""
+        model = self.model
+        if hasattr(model, "module") and hasattr(model.module, "config"):
+            return model.module.config
+        elif hasattr(model, "config"):
+            return model.config
+        return None
+
+    def _calculate_refit_param_info(self) -> list[tuple[str, int]]:
+        """Calculate parameter information for refit.
+
+        Each task contains:
+        - param_name: Local parameter name without module prefixes
+        - mapping: MegatronParamMapping instance for weight transformation
+        - pp_rank: Pipeline-parallel rank owning the parameter
+        - vp_stage: Virtual-pipeline stage index
+        - megatron_module: Reference to Megatron model/submodule
+        - param_weight: Target parameter tensor for converted weight
+
+        Returns:
+            List of (parameter_name, size_in_bytes) tuples.
+        """
+        self.refit_conversion_tasks = [
+            task
+            for task in self.megatron_bridge.get_conversion_tasks([self.model])
+            if task is not None
+        ]
+        param_info = []
+
+        def calculate_size_in_bytes(param, tp_size, ep_size):
+            if param is None:
+                # need to broadcast for other pp ranks
+                size_in_bytes = None
+            else:
+                # Calculate size for this parameter
+                prec_to_bytes = {
+                    torch.bfloat16: 2,
+                    torch.float16: 2,
+                    torch.float32: 4,
+                    torch.float8_e4m3fn: 1,
+                    torch.float8_e5m2: 1,
+                }
+                scale = prec_to_bytes[self.dtype] / prec_to_bytes[param.dtype]
+                size_in_bytes = (
+                    param.element_size() * param.numel() * tp_size * ep_size * scale
+                )
+
+            # Broadcast size_in_bytes across pipeline parallel ranks
+            return broadcast_obj_from_pp_rank(size_in_bytes)
+
+        for task in self.refit_conversion_tasks:
+            param_info.append(
+                (
+                    task.param_name,
+                    calculate_size_in_bytes(
+                        task.param_weight,
+                        task.mapping.tp_size,
+                        task.mapping.ep_size if task.mapping.is_expert else 1,
+                    ),
+                )
+            )
+        return param_info
+
+    def _iter_params_with_optional_kv_scales(
+        self,
+        kv_scales: Optional[dict[str, float]] = None,
+    ) -> Iterator[tuple[str, torch.Tensor]]:
+        """Yield exported HF parameters and optionally append FP8 KV/Q scale tensors.
+
+        This helper is used by both IPC-based streaming and collective broadcast
+        so that the logic for adding KV scales stays consistent in one place.
+        """
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            get_vllm_qkv_scale_names,
+        )
+
+        base_iter = self.megatron_bridge.export_hf_weights(
+            [self.model],
+            show_progress=False,
+            conversion_tasks=self.refit_conversion_tasks,  # used for metadata caching
+        )
+
+        # Yield the original parameters first.
+        for name, tensor in base_iter:
+            yield name, tensor
+
+        if self.draft_model is not None:
+            from nemo_rl.models.megatron.draft import export_eagle_weights_to_hf
+
+            draft_weights = export_eagle_weights_to_hf(
+                self.draft_model,
+            )
+            for name, tensor in draft_weights:
+                yield f"draft.{name}", tensor
+
+        # Check whether FP8 KV cache is enabled.
+        use_fp8_kv_cache = False
+        if (
+            "generation" in self.cfg
+            and self.cfg["generation"] is not None
+            and self.cfg["generation"]["backend"] == "vllm"
+        ):
+            generation_cfg = cast(VllmConfig, self.cfg["generation"])
+            use_fp8_kv_cache = (
+                "vllm_cfg" in generation_cfg
+                and "kv_cache_dtype" in generation_cfg["vllm_cfg"]
+                and generation_cfg["vllm_cfg"]["kv_cache_dtype"].startswith("fp8")
+            )
+
+        if not use_fp8_kv_cache:
+            return
+
+        # Append KV (and potentially Q) scale entries to match metadata.
+        num_layers = self.megatron_bridge.transformer_config.num_layers
+        keys: list[str] = []
+        for layer_idx in range(num_layers):
+            scale_names = get_vllm_qkv_scale_names(layer_idx)
+            keys.extend(scale_names.values())
+
+        for param_name in keys:
+            if kv_scales and param_name in kv_scales:
+                scale_value = kv_scales[param_name]
+            else:
+                scale_value = 1.0
+            scale_tensor = torch.tensor(
+                scale_value, dtype=torch.float32, device="cuda"
+            ).reshape(1)
+            yield param_name, scale_tensor
+
+    @torch.no_grad()
+    @wrap_with_nvtx_name("megatron_policy_worker/stream_weights_via_ipc_zmq")
+    def stream_weights_via_ipc_zmq(
+        self, buffer_size_bytes: int = 0, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
+        """Stream model weights to peer process via ZMQ IPC socket."""
+        self.maybe_init_zmq()
+
+        from nemo_rl.models.policy.utils import stream_weights_via_ipc_zmq_impl
+
+        # Use the shared implementation to append optional KV scales.
+        stream_weights_via_ipc_zmq_impl(
+            params_generator=self._iter_params_with_optional_kv_scales(
+                kv_scales=kv_scales
+            ),
+            buffer_size_bytes=buffer_size_bytes,
+            zmq_socket=self.zmq_socket,
+            rank=self.rank,
+            worker_name=str(self),
+        )
+
+    @torch.no_grad()
+    def broadcast_weights_for_collective(
+        self, kv_scales: Optional[dict[str, float]] = None
+    ) -> None:
+        """Broadcast the weights for collective communication."""
+        # param_iterator will return (name, tensor), we only need tensor.
+        packed_broadcast_producer(
+            iterator=self._iter_params_with_optional_kv_scales(kv_scales=kv_scales),
+            group=self.model_update_group,
+            src=0,
+            post_iter_func=lambda x: x[1],
+        )
+
+    def _use_real_quant_refit(self) -> bool:
+        return False
+
+    def prepare_for_lp_inference(self):
+        self.model = self.move_model(self.model, "cuda", move_grads=False)
+        self.model.eval()
+
+        # offload grads to cpu
+        self.model = self.move_model(
+            self.model, "cpu", move_params=False, move_grads=True
+        )  # get rid of grad buffers
+
+        # offload optimizer to cpu
+        torch.randn(1).cuda()  # wake up torch allocator
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+            and self.offload_optimizer_for_logprob
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def prepare_for_training(self, *args, **kwargs):
+        # onload models and optimizer state to cuda
+        self.model = self.move_model(
+            self.model, "cuda", move_grads=True, move_params=True
+        )
+        self.model.train()
+
+        # Training expects optimizer state on CUDA. Keep this unconditional rather
+        # than trying to mirror every path that may have offloaded it to CPU.
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+        ):
+            self.move_optimizer("cuda")
+
+        if self.cfg["megatron_cfg"]["empty_unused_memory_level"] >= 1:
+            torch.cuda.empty_cache()
+
+    def finish_inference(self) -> None:
+        """Offload model params to CPU after inference. Only used in PPO."""
+        self.model = self.move_model(
+            self.model, "cpu", move_params=True, move_grads=False
+        )
+        self.model.eval()
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    def _clear_fp8_caches(self):
+        """Clear FP8 workspace caches and release fragmented GPU memory.
+
+        The main memory issue in the train→offload→refit→generate cycle is CUDA
+        allocator fragmentation, not leaked FP8 tensors. This method clears
+        per-module _fp8_workspaces buffers (scratch memory references). The
+        caller is responsible for running gc.collect() + empty_cache() once
+        all references have been dropped.
+
+        For anti-fragmentation, configure PYTORCH_CUDA_ALLOC_CONF in the recipe YAML:
+        - "max_split_size_mb:512" — fast, prevents large-block splitting
+        - "expandable_segments:True" — most effective but ~5x slower weight transfer
+        """
+        # 1. Clear Transformer Engine workspaces
+        workspace_count = 0
+        for module in self.model.modules():
+            if hasattr(module, "_fp8_workspaces"):
+                module._fp8_workspaces.clear()
+                workspace_count += 1
+
+        print(
+            f"[_clear_fp8_caches] Cleared {workspace_count} workspace modules on rank {self.rank}"
+        )
+
+    @wrap_with_nvtx_name("megatron_policy_worker/offload_before_refit")
+    def offload_before_refit(self):
+        """Offload the optimizer and buffers to the CPU."""
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(
+            f"GPU Memory before optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+        self.model = self.move_model(
+            self.model, "cpu", move_params=False, move_grads=True
+        )  # get rid of grad buffers
+
+        # When True, clear Transformer Engine's per-module _fp8_workspaces scratch
+        # buffers in offload_before_refit (before weight transfer to the inference
+        # engine).
+        if self.fp8_cfg and self.fp8_cfg.get("force_clear_fp8_caches", False):
+            self._clear_fp8_caches()
+
+        if self.cfg["megatron_cfg"].get("clear_memory_caches_before_refit", False):
+            # Clear RotaryEmbedding's @lru_cache(maxsize=32). The cache accumulates one
+            # entry per unique (max_seq_len, offset, packed_seq) seen, and each entry is
+            # a GPU tensor (the concatenated sin/cos embedding). With training + logprob
+            # runs at different sequence lengths, the cache fills quickly and the tensors
+            # anchor large CUDA segments.
+            try:
+                from megatron.core.models.common.embeddings.rotary_pos_embedding import (
+                    RotaryEmbedding,
+                )
+
+                RotaryEmbedding.forward.cache_clear()
+            except Exception:
+                pass
+
+            # Clear MoE token dispatcher persistent routing tensors.
+            #
+            # MoETokenDispatcher is a plain Python class (NOT an nn.Module), so iterating
+            # self.model.modules() never yields it. We must access it via the token_dispatcher
+            # attribute on MoELayer nn.Module objects.
+            #
+            # When recompute_mlp=True and fp8=True,
+            # transformer_layer._forward_mlp wraps self.mlp (the MoE layer) with te_checkpoint.
+            # te_checkpoint._CheckpointFunction.backward recomputes the forward with
+            # torch.enable_grad(), which causes dispatch_preprocess to store
+            #   dispatcher.probs = routing_probs   (with grad_fn, under enable_grad)
+            # This creates a reference cycle:
+            #   _CheckpointFunctionBackward → ctx → ctx.run_function=mlp
+            #   → mlp.token_dispatcher.probs → probs.grad_fn → ... → _CheckpointFunctionBackward
+            #
+            # Breaking this cycle by nulling dispatcher.probs frees BOTH:
+            #   - the routing tensors
+            #   - the te_checkpoint ctx saved tensors
+            try:
+                for module in self.model.modules():
+                    if not hasattr(module, "token_dispatcher"):
+                        continue
+                    dispatcher = module.token_dispatcher
+                    if dispatcher is None:
+                        continue
+                    for attr in (
+                        "probs",  # AllToAll + AllGather
+                        "routing_map",  # AllToAll
+                        "reversed_local_input_permutation_mapping",  # AllToAll
+                        "local_probs",  # AllGather
+                        "local_map",  # AllGather
+                    ):
+                        if isinstance(getattr(dispatcher, attr, None), torch.Tensor):
+                            setattr(dispatcher, attr, None)
+            except Exception:
+                pass
+
+        torch.randn(1).cuda()  # wake up torch allocator
+        if (
+            hasattr(self, "optimizer")
+            and self.optimizer is not None
+            and not self.optimizer_cpu_offload
+        ):
+            self.move_optimizer("cpu")
+
+        gc.collect()
+        torch.cuda.empty_cache()
+
+        # Print memory stats after offloading
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(
+            f"GPU Memory after optimizer offload: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+        no_grad.__exit__(None, None, None)
+
+    @wrap_with_nvtx_name("megatron_policy_worker/offload_after_refit")
+    def offload_after_refit(self):
+        """Offload as much as possible on the CPU."""
+        no_grad = torch.no_grad()
+        no_grad.__enter__()
+        self.model = self.move_model(self.model, "cpu")
+        self.model.eval()
+        torch.randn(1).cuda()  # wake up torch allocator
+        self.offload_before_refit()  # rerun the old offload function
+
+        allocated = torch.cuda.memory_allocated() / (1024**3)  # Convert to GB
+        reserved = torch.cuda.memory_reserved() / (1024**3)  # Convert to GB
+        print(
+            f"GPU Memory after refit complete: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved"
+        )
+        no_grad.__exit__(None, None, None)
+
+    @torch.no_grad()
+    def move_model(
+        self,
+        model: torch.nn.Module,
+        device: str,
+        move_params: bool = True,
+        move_grads: bool = True,
+    ) -> torch.nn.Module:
+        # move all param and grad buffers to the device
+        if isinstance(model, DistributedDataParallel):
+            # DDP case
+            for buffers in [model.buffers, model.expert_parallel_buffers]:
+                for buffer_idx in range(len(buffers)):
+                    if device == "cpu":
+                        buffers[buffer_idx].offload_to_cpu(
+                            move_params=move_params, move_grads=move_grads
+                        )
+                    elif device == "cuda":
+                        buffers[buffer_idx].reload_from_cpu(
+                            move_params=move_params, move_grads=move_grads
+                        )
+                    else:
+                        raise ValueError(
+                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+                        )
+        elif isinstance(model, custom_FSDP):
+            if device == "cpu":
+                model.param_and_grad_buffer.offload_to_cpu(move_params, move_grads)
+            elif device == "cuda":
+                model.param_and_grad_buffer.reload_from_cpu(
+                    move_params=move_params, move_grads=move_grads
+                )
+            else:
+                raise ValueError(
+                    f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+                )
+        else:
+            # Ordinary offload case
+            if move_params:
+                new_state_dict = {}
+                for name, item in model.state_dict().items():
+                    if isinstance(item, torch.Tensor):
+                        item = item.detach().to(
+                            device=device, non_blocking=True, copy=True
+                        )
+                    new_state_dict[name] = item
+                model.load_state_dict(new_state_dict)
+        return model
+
+    def move_optimizer(self, device: str):
+        # Iterate through the state dictionaries for each parameter group
+        if isinstance(self.optimizer, ChainedOptimizer):
+            optimizer_state = self.optimizer.state
+        else:
+            optimizer_state = self.optimizer._get_state()
+        for _, state in optimizer_state.items():
+            # Iterate through the state items (e.g., momentum, variance) for a parameter
+            for k, v in state.items():
+                # Check if the item is a tensor
+                if torch.is_tensor(v):
+                    # Move the tensor to device and update the state dictionary
+                    if device == "cpu":
+                        if v.is_cuda:
+                            state[k] = v.to("cpu")
+                    elif device == "cuda":
+                        if not v.is_cuda:
+                            state[k] = v.to("cuda")
+                    else:
+                        raise ValueError(
+                            f"Invalid device: {device}. Only strings 'cpu' and 'cuda' are supported."
+                        )
+
+    def save_checkpoint(
+        self,
+        weights_path: str,
+        optimizer_path: Optional[str] = None,
+        **kwargs,
+    ):
+        """Save a training checkpoint.
+
+        Args:
+            weights_path: The specific directory path where the checkpoint will be saved.
+            optimizer_path: If not None, optimizer and scheduler states are saved if they exist.
+        """
+        if not torch.distributed.is_initialized():
+            raise RuntimeError(
+                "Distributed process group is not initialized. Cannot save checkpoint."
+            )
+
+        if self.mcore_state is None or self.model is None:
+            raise RuntimeError(
+                "Megatron core state or model is not initialized. Cannot save checkpoint."
+            )
+
+        original_save_path = self.mcore_state.cfg.checkpoint.save
+        is_async = self.mcore_state.cfg.checkpoint.async_save
+
+        try:
+            # Block until any previous async save is fully written to disk.
+            # With sync save this is a no-op.
+            maybe_finalize_async_save(
+                self.mcore_state,
+                ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                blocking=True,
+            )
+            self.mcore_state.cfg.checkpoint.save = weights_path
+
+            optimizer_to_save = None
+            scheduler_to_save = None
+
+            if optimizer_path is not None:
+                if self.optimizer is not None:
+                    optimizer_to_save = self.optimizer
+                if self.scheduler is not None:
+                    scheduler_to_save = self.scheduler
+
+            # Ensure model is in eval mode for consistent saving, unless actively training
+            # This is a common practice, though NeMo's save might handle this.
+            # For safety, if not in training loop, setting to eval.
+            is_training = self.model.training
+            if not is_training:
+                self.model.eval()
+
+            if self.should_disable_forward_pre_hook:
+                self.disable_forward_pre_hook()
+            save_checkpoint(
+                state=self.mcore_state,
+                model=[self.model],
+                optimizer=optimizer_to_save,
+                opt_param_scheduler=scheduler_to_save,
+                num_floating_point_operations_so_far=self.mcore_state.train_state.floating_point_operations_so_far,
+                checkpointing_context=self.checkpointing_context,
+            )
+
+            if not is_async:
+                # Sync path: finalize immediately (runs finalize_fns + barrier).
+                maybe_finalize_async_save(
+                    self.mcore_state,
+                    ckpt_cfg=self.mcore_state.cfg.checkpoint,
+                    blocking=True,
+                )
+            if self.should_disable_forward_pre_hook:
+                self.enable_forward_pre_hook()
+
+            if not is_training:
+                self.model.train()
+
+        except Exception as e:
+            print(f"Failed to save checkpoint to {weights_path}: {e}")
+            raise
+        finally:
+            self.mcore_state.cfg.checkpoint.save = original_save_path
+
+    def load_checkpoint(self, weights_path: str, optimizer_path: Optional[str] = None):
+        """Load a training checkpoint.
+
+        Args:
+            weights_path: The exact directory path from which to load the checkpoint.
+            optimizer_path: If not None, attempts to load optimizer and scheduler states
+                            if self.optimizer and self.scheduler are initialized.
+        """
+        raise NotImplementedError(
+            "Loading checkpoints outside of the init function is not yet implemented for Megatron policy."
+        )
+
+    def check_tensor_parallel_attributes(self) -> dict[str, Any]:
+        """Check tensor parallel attributes on model parameters.
+
+        Returns:
+            Dictionary containing information about tensor parallel parameters:
+            - tp_params: List of parameter names that have tensor_model_parallel=True
+            - non_tp_params: List of parameter names that have tensor_model_parallel=False
+            - total_params: Total number of parameters checked
+            - tp_size: Tensor parallel size from config
+        """
+        tp_params = []
+        non_tp_params = []
+        total_params = 0
+
+        for name, param in self.model.named_parameters():
+            total_params += 1
+            tensor_model_parallel = getattr(param, "tensor_model_parallel", False)
+
+            if tensor_model_parallel:
+                tp_params.append(
+                    {
+                        "name": name,
+                        "tensor_model_parallel": tensor_model_parallel,
+                        "partition_dim": getattr(param, "partition_dim", None),
+                        "partition_stride": getattr(param, "partition_stride", None),
+                        "shape": list(param.shape),
+                    }
+                )
+            else:
+                non_tp_params.append(
+                    {
+                        "name": name,
+                        "tensor_model_parallel": tensor_model_parallel,
+                        "shape": list(param.shape),
+                    }
+                )
+
+        return {
+            "tp_params": tp_params,
+            "non_tp_params": non_tp_params,
+            "total_params": total_params,
+            "tp_size": self.megatron_cfg.model.tensor_model_parallel_size,
+        }
+
+    @torch.no_grad()
+    def calibrate_qkv_fp8_scales(
+        self,
+        *,
+        data: BatchedDataDict[Any],
+        micro_batch_size: Optional[int] = None,
+        percentile: float = 99.9,
+        margin: float = 1.05,
+        include_q: bool = False,
+    ) -> dict[str, Any]:
+        """One-shot calibration of Q/K/V activation scales (for FP8 KV cache).
+
+        - Captures each layer's `query_key_value` output through forward hooks, splits Q/K/V, and computes percentile amax.
+        - In parallel (DP/TP/PP) environments, first computes local percentiles, then takes max across all ranks for conservativeness.
+        - By default only returns and saves K/V scales, optionally returns Q.
+
+        Args:
+            data: Representative sample batch for calibration, following get_logprobs input conventions.
+            micro_batch_size: Micro batch size during calibration; if None, reuses logprob_batch_size.
+            percentile: Percentile for amax (e.g. 99.9).
+            margin: Margin factor, e.g. 1.05.
+            save_path: If provided, rank0 will save results as JSON.
+            include_q: Whether to also return Q scale (usually only K/V needed).
+
+        Returns:
+            { "format": "fp8", "percentile": float, "margin": float,
+              "layers": { layer_name: {"k_scale": float, "v_scale": float[, "q_scale": float] } } }
+        """
+        from nemo_rl.models.generation.vllm.quantization.fp8_train_utils import (
+            convert_calibration_to_vllm_format,
+        )
+
+        # Allow overriding FP8 max for Q, K, V via environment variables for ease of testing.
+        # Defaults align with FP8 e4m3 max magnitude.
+        # Use different defaults for Q, K, V to adapt to distribution diffefences
+        def _get_env_float(name: str, default: float) -> float:
+            try:
+                val = os.getenv(name, None)
+                return float(val) if val is not None and val != "" else default
+            except Exception:
+                return default
+
+        FP8_MAX_Q = _get_env_float("FP8_MAX_Q", 448.0)
+        FP8_MAX_K = _get_env_float("FP8_MAX_K", 448.0)
+        FP8_MAX_V = _get_env_float("FP8_MAX_V", 448.0)
+
+        self.model.eval()
+
+        # Record local percentile amax for q/k/v of each layer
+        layer_to_samples_q: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_k: dict[str, list[float]] = defaultdict(list)
+        layer_to_samples_v: dict[str, list[float]] = defaultdict(list)
+        hook_handles = []
+
+        def _extract_layer_key(module_name: str) -> str:
+            # Expected format: "module.decoder.layers.<idx>.self_attention.query_key_value"
+            m = re.search(r"module\.decoder\.layers\.(\d+)", module_name)
+            if m is not None:
+                return f"layer_{m.group(1)}"
+            return module_name
+
+        # Hook to capture q/k/v after q/k norm and RoPE
+        def _pre_hook_builder_core_attention(module_name: str):
+            layer_key = _extract_layer_key(module_name)
+
+            def _pre_hook(module, inputs):
+                args = inputs if isinstance(inputs, (tuple, list)) else (inputs,)
+                if len(args) == 1 and isinstance(args[0], (tuple, list)):
+                    args = args[0]
+                # Expected first 3 args to be q, k, v (typical signature for Megatron CoreAttention)
+                q = args[0]
+                k = args[1]
+                v = args[2]
+                if include_q:
+                    layer_to_samples_q[layer_key].append(
+                        float(torch.amax(torch.abs(q)).item())
+                    )
+                layer_to_samples_k[layer_key].append(
+                    float(torch.amax(torch.abs(k)).item())
+                )
+                layer_to_samples_v[layer_key].append(
+                    float(torch.amax(torch.abs(v)).item())
+                )
+
+            return _pre_hook
+
+        matched_modules = []
+        # Try to register forward_pre_hook on core_attention first
+        for name, module in self.model.named_modules():
+            if "self_attention.core_attention" in name:
+                try:
+                    handle = module.register_forward_pre_hook(
+                        _pre_hook_builder_core_attention(name)
+                    )
+                    hook_handles.append(handle)
+                    matched_modules.append((name, module.__class__.__name__, "pre"))
+                except Exception as e:
+                    print(
+                        f"Error registering pre-hook for qkv scale calibration on {name}: {e}"
+                        " Please check if the model is compatible with the current calibration logic. "
+                        "The expected module name is 'self_attention.core_attention'."
+                    )
+                    raise
+
+        # Run a forward pass to trigger hooks (reuse get_logprobs forward path).
+        # Calibration batches are prompt-only model inputs, not rollout replay
+        # batches, so they intentionally do not carry routed_experts.
+        try:
+            _ = self.get_logprobs(
+                data=data,
+                micro_batch_size=micro_batch_size,
+                require_router_replay=False,
+            )
+        finally:
+            for h in hook_handles:
+                try:
+                    h.remove()
+                except Exception as e:
+                    print(f"Error removing hook for qkv scale calibration: {e}")
+                    raise
+
+        # Compute local percentile amax
+        def _percentile(values: list[float], p: float) -> float:
+            if not values:
+                return 0.0
+            t = torch.tensor(sorted(values), device="cuda", dtype=torch.float32)
+            rank = max(
+                0, min(len(values) - 1, int(round((p / 100.0) * (len(values) - 1))))
+            )
+            return float(t[rank].item())
+
+        local_layer_to_pamax = {}
+        for layer_key in set(
+            list(layer_to_samples_k.keys())
+            + list(layer_to_samples_v.keys())
+            + (list(layer_to_samples_q.keys()) if include_q else [])
+        ):
+            entry = {}
+            if include_q:
+                entry["q_amax_p"] = _percentile(
+                    layer_to_samples_q.get(layer_key, []), percentile
+                )
+            entry["k_amax_p"] = _percentile(
+                layer_to_samples_k.get(layer_key, []), percentile
+            )
+            entry["v_amax_p"] = _percentile(
+                layer_to_samples_v.get(layer_key, []), percentile
+            )
+            local_layer_to_pamax[layer_key] = entry
+
+        # Merge across all ranks: take maximum of percentile amax (conservative approach)
+        world_size = (
+            torch.distributed.get_world_size()
+            if torch.distributed.is_initialized()
+            else 1
+        )
+        gathered = [None for _ in range(world_size)] if world_size > 1 else None
+        if world_size > 1:
+            torch.distributed.all_gather_object(gathered, local_layer_to_pamax)
+            merged = defaultdict(dict)
+            for d in gathered:  # type: ignore
+                if d is None:
+                    continue
+                for k, v in d.items():
+                    dst = merged[k]
+                    for kk, vv in v.items():
+                        dst[kk] = max(dst.get(kk, 0.0), float(vv))
+            layer_to_pamax = dict(merged)
+        else:
+            layer_to_pamax = local_layer_to_pamax
+
+        # Compute scale (symmetric quantization): scale = pamax / fp8_max
+        result_layers = {}
+        for layer_key, vals in layer_to_pamax.items():
+            out_entry = {}
+            if include_q:
+                q_scale = (vals.get("q_amax_p", 0.0) * margin) / FP8_MAX_Q
+                out_entry["q_scale"] = float(q_scale)
+            k_scale = (vals.get("k_amax_p", 0.0) * margin) / FP8_MAX_K
+            v_scale = (vals.get("v_amax_p", 0.0) * margin) / FP8_MAX_V
+            out_entry["k_scale"] = float(k_scale)
+            out_entry["v_scale"] = float(v_scale)
+            result_layers[layer_key] = out_entry
+
+        vllm_format_scales = convert_calibration_to_vllm_format(result_layers)
+
+        final_result = {
+            "format": "fp8",
+            "percentile": percentile,
+            "margin": margin,
+            "layers": vllm_format_scales,
+        }
+
+        # Sync results across all ranks (broadcast rank0's result)
+        if world_size > 1:
+            if torch.distributed.get_rank() == 0:
+                obj_list = [final_result]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]
+            else:
+                obj_list = [None]
+                torch.distributed.broadcast_object_list(obj_list, src=0)
+                final_result = obj_list[0]  # type: ignore
+
+        return final_result
+
+
+@ray.remote(
+    runtime_env=get_runtime_env_for_policy_worker("megatron_policy_worker")
+)  # pragma: no cover
+class MegatronPolicyWorker(MegatronPolicyWorkerImpl):
+    pass
