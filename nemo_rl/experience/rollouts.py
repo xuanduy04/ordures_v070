@@ -1544,6 +1544,7 @@ def run_async_nemo_gym_rollout(
         {
             "agent_ref": [r["agent_ref"] for r in results],
             "message_log": [r["message_log"] for r in results],
+            "full_result": [r["full_result"] for r in results],
             # length is used downstream for mean_prompt_length
             "length": torch.tensor(
                 [len(r["input_message_log"][0]["token_ids"]) for r in results]

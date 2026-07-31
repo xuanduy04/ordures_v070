@@ -177,6 +177,9 @@ def test_nemo_gym_postprocess_uses_batch_decode():
         def __init__(self):
             self.batch_decode_calls = []
 
+        def decode(self, token_ids):
+            return " ".join(map(str, token_ids))
+
         def batch_decode(self, batch):
             self.batch_decode_calls.append([list(token_ids) for token_ids in batch])
             return [" ".join(map(str, token_ids)) for token_ids in batch]
@@ -270,6 +273,8 @@ def test_nemo_gym_sanity(
 
         # We remove these fields and message from comparison since we cannot guarantee exact generation reproducibility
         d["message_log"] = d["message_log"][:2]
+        for message in d["message_log"]:
+            message["content"] = ""
         for message in d["message_log"][1:]:
             if "token_ids" in message:
                 message["token_ids"] = []

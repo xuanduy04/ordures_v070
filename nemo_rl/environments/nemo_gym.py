@@ -382,7 +382,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
             user_message = {
                 "role": "user",
-                "content": "",
+                "content": tokenizer.decode(new_prompt_token_ids),
                 "token_ids": torch.tensor(new_prompt_token_ids),
             }
             if routed_experts is not None:
@@ -403,7 +403,7 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
 
             assistant_message = {
                 "role": "assistant",
-                "content": "",
+                "content": tokenizer.decode(generation_token_ids),
                 "token_ids": torch.tensor(generation_token_ids),
                 "generation_logprobs": torch.tensor(generation_log_probs),
                 "is_invalid_tool_call": is_invalid_tool_call,

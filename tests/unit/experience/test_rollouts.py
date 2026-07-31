@@ -1005,6 +1005,8 @@ def test_run_async_nemo_gym_rollout(
 
     def _standardize(d: dict) -> dict:
         final_batch = d["final_batch"].copy()
+        final_batch.pop("agent_ref", None)
+        final_batch.pop("full_result", None)
         final_batch.pop("message_log", None)
         final_batch["total_reward"] = final_batch["total_reward"].tolist()
         final_batch["loss_multiplier"] = final_batch["loss_multiplier"].tolist()
