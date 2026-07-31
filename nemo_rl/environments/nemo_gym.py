@@ -280,20 +280,52 @@ Depending on your data shape, you may want to change these values."""
         max_attempts, trial = self.rollout_max_attempts_to_avoid_lp_nan, 0
         while trial < max_attempts:
             nemo_gym_num_rows = len(nemo_gym_examples)
-            nemo_gym_result_iterator = self.rch.run_examples(
+            nemo_gym_tasks = list(self.rch.run_examples(
                 examples=nemo_gym_examples, head_server_config=self.head_server_config
-            )
+            ))
 
             nemo_rl_rowidxs = []
             nemo_rl_results = []
-            for task in nemo_gym_result_iterator:
+            for nemo_gym_task_idx, task in enumerate(nemo_gym_tasks):
                 with timer.time(label=f"{timer_prefix}/await_results"):
-                    nemo_gym_row, nemo_gym_result = await task
+                    try:
+                        nemo_gym_row, nemo_gym_result = await task
+                    except Exception as e:
+                        print(
+                            f"[!!!WARNING!!!] NeMo-Gym rollout failed for sample {nemo_gym_task_idx} "
+                            f"(total {nemo_gym_num_rows}): {e}"
+                        )
+                        import traceback
+                        traceback.print_exc()
+                        nemo_gym_row = {"_rowidx": nemo_gym_task_idx}
+                        nemo_gym_result = {
+                            "response": {"output": []},
+                            "reward": 0.0,
+                            "responses_create_params": {"input": []},
+                        }
 
                 with timer.time(label=f"{timer_prefix}/postprocess_results"):
-                    nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
-                        nemo_gym_result, tokenizer
-                    )
+                    try:
+                        nemo_rl_result = self._postprocess_nemo_gym_to_nemo_rl_result(
+                            nemo_gym_result, tokenizer
+                        )
+                    except Exception as e:
+                        print(
+                            f"[!!!WARNING!!!] Postprocessing failed for sample {nemo_gym_task_idx}: {e}"
+                        )
+                        import traceback
+                        traceback.print_exc()
+                        nemo_rl_result = {
+                            "message_log": [],
+                            "input_message_log": [
+                                {
+                                    "role": "user",
+                                    "content": "",
+                                    "token_ids": torch.tensor([], dtype=torch.long),
+                                }
+                            ],
+                            "full_result": {"reward": 0.0},
+                        }
 
                 nemo_rl_rowidxs.append(nemo_gym_row["_rowidx"])
                 nemo_rl_results.append(nemo_rl_result)
@@ -454,18 +486,41 @@ Output prompt token IDs: {output_item_dict["prompt_token_ids"]}
                 output_item_dict["generation_str"] = generation_str
 
         if not nemo_rl_message_log:
-            input_messages = nemo_gym_result["responses_create_params"]["input"]
-            prompt_token_ids = tokenizer.apply_chat_template(
-                input_messages, tokenize=True
-            )
-            raise ValueError(
-                f"NeMo Gym returned a result with no generation data. "
-                f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
-                f"so vLLM rejected the request before any tokens could be generated.\n"
-                f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
-                f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
-                f"to a value larger than {len(prompt_token_ids)}."
-            )
+            # Return a maskable dummy result so training can continue.
+            # This covers legitimate cases (prompt exceeds vLLM max_model_len)
+            # as well as bugged/malformed samples whose rollout was skipped.
+            try:
+                input_messages = nemo_gym_result["responses_create_params"]["input"]
+                prompt_token_ids = tokenizer.apply_chat_template(
+                    input_messages, tokenize=True
+                )
+                print(
+                    f"NeMo Gym returned a result with no generation data. "
+                    f"This typically means the prompt for the first turn already exceeds the vLLM max_model_len, "
+                    f"so vLLM rejected the request before any tokens could be generated.\n"
+                    f"  Prompt length: {len(prompt_token_ids)} tokens.\n"
+                    f"  → Fix: increase `policy.max_total_sequence_length` and `policy.generation.vllm_cfg.max_model_len` "
+                    f"to a value larger than {len(prompt_token_ids)}.\n"
+                    f"This sample will be masked (loss_multiplier=0). "
+                )
+            except Exception:
+                print(
+                    "NeMo Gym returned a result with bugged generation data that couldn't be tokenized "
+                    "(likely a bugged/malformed sample).\n"
+                    f"  {input_messages=}"
+                    "This sample will be masked (loss_multiplier=0)."
+                )
+            return {
+                "message_log": [],
+                "input_message_log": [
+                    {
+                        "role": "user",
+                        "content": "",
+                        "token_ids": torch.tensor([], dtype=torch.long),
+                    }
+                ],
+                "full_result": nemo_gym_result if isinstance(nemo_gym_result, dict) else {"reward": 0.0},
+            }
 
         return {
             "message_log": nemo_rl_message_log,
