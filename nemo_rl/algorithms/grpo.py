@@ -1595,14 +1595,14 @@ def _apply_message_level_advantage_penalties(
                     f"Setting negative advantage ({invalid_neg_adv}) for invalid tool call in assistant message {i} {j}",
                     flush=True,
                 )
-                advantages[i, token_offset : token_offset + msg_len] = invalid_neg_adv
-            elif is_malformed_thinking:
+                advantages[i, token_offset : token_offset + msg_len].add_(invalid_neg_adv).clamp_(max=invalid_neg_adv)
+            if is_malformed_thinking:
                 num_malformed_thinking += 1
                 print(
                     f"Setting negative advantage ({malformed_neg_adv}) for malformed thinking in assistant message {i} {j}",
                     flush=True,
                 )
-                advantages[i, token_offset : token_offset + msg_len] = malformed_neg_adv
+                advantages[i, token_offset : token_offset + msg_len].add_(malformed_neg_adv).clamp_(max=malformed_neg_adv)
             token_offset += msg_len
 
     invalid_tool_call_rate = num_invalid_tool_calls / max(num_assistant_messages, 1)
