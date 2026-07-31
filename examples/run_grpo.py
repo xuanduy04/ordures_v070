@@ -157,12 +157,8 @@ def main() -> None:
 
     # Check if async mode is enabled
     if "async_grpo" in config.grpo and config.grpo["async_grpo"]["enabled"]:
-        # Async GRPO does not support dynamic sampling, reward scaling, or reward shaping (DAPO features)
-        unsupported_features = [
-            "use_dynamic_sampling",
-            "reward_scaling",
-            "reward_shaping",
-        ]
+        # Async GRPO does not support dynamic sampling (implementation issue with async) and reward scaling
+        unsupported_features = ["use_dynamic_sampling", "reward_scaling"]
 
         for feature in unsupported_features:
             if feature not in config.grpo:

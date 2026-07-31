@@ -18,6 +18,7 @@ import torch
 from nemo_rl.algorithms.grpo import RewardScalingConfig, scale_rewards
 from nemo_rl.algorithms.reward_functions import (
     RewardShapingConfig,
+    _compute_n_gram_repetition_penalty,
     apply_reward_shaping,
 )
 from nemo_rl.data.interfaces import DatumSpec
@@ -260,11 +261,12 @@ def test_reward_shaping_disabled_does_not_save_unshaped_reward():
     assert "unshaped_total_reward" not in result_batch
 
 
-def test_reward_shaping_missing_config_values():
-    """Test that missing required config values raise ValueError."""
+def test_reward_shaping_missing_dapo_params_is_noop():
+    """Test that missing DAPO config values result in a no-op (not an error)."""
     batch = create_mock_batch_with_responses(
         num_samples=1, response_lengths=[20], initial_rewards=[1.0]
     )
+    original_rewards = batch["total_reward"].clone()
 
     # Test missing overlong_buffer_length
     config = RewardShapingConfig(
@@ -273,23 +275,20 @@ def test_reward_shaping_missing_config_values():
         overlong_buffer_penalty=0.1,
         max_response_length=25,
     )
-
-    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
-        apply_reward_shaping(batch, config)
+    result_batch = apply_reward_shaping(batch, config)
+    assert torch.allclose(result_batch["total_reward"], original_rewards)
 
     # Test missing overlong_buffer_penalty
     config["overlong_buffer_length"] = 5
     config["overlong_buffer_penalty"] = None
-
-    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
-        apply_reward_shaping(batch, config)
+    result_batch = apply_reward_shaping(batch, config)
+    assert torch.allclose(result_batch["total_reward"], original_rewards)
 
     # Test missing max_response_length
     config["overlong_buffer_penalty"] = 0.1
     config["max_response_length"] = None
-
-    with pytest.raises(ValueError, match="DAPO reward shaping is currently supported"):
-        apply_reward_shaping(batch, config)
+    result_batch = apply_reward_shaping(batch, config)
+    assert torch.allclose(result_batch["total_reward"], original_rewards)
 
 
 def test_reward_shaping_missing_assistant_response():
@@ -349,7 +348,7 @@ def test_reward_shaping_mismatched_lengths():
 
 
 def test_stop_properly_penalty():
-    """Test stop_properly_penalty_coef scales rewards for truncated samples."""
+    """Test stop_properly_penalty_coef shifts rewards for truncated samples."""
     batch = create_mock_batch_with_responses(
         num_samples=4,
         response_lengths=[10, 20, 30, 40],
@@ -360,14 +359,14 @@ def test_stop_properly_penalty():
     config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.5)
     result_batch = apply_reward_shaping(batch, config)
 
-    # Non-truncated unchanged, truncated scaled by 0.5
-    expected_rewards = torch.tensor([1.0, 0.4, 0.6, 0.2])
+    # Non-truncated unchanged, truncated shifted down by 0.5
+    expected_rewards = torch.tensor([1.0, 0.3, 0.6, -0.1])
     assert torch.allclose(result_batch["total_reward"], expected_rewards, atol=1e-6)
 
 
 def test_stop_properly_penalty_boundary_coefs():
-    """Test boundary values: coef=0 gives zero reward, coef=1 has no effect."""
-    # Test coef=0: truncated samples get zero reward
+    """Test boundary values: coef=0 gives no shift, coef=1 subtracts 1.0."""
+    # Test coef=0: truncated samples unchanged (subtract 0)
     batch = create_mock_batch_with_responses(
         num_samples=2, response_lengths=[10, 20], initial_rewards=[1.0, 0.5]
     )
@@ -375,17 +374,17 @@ def test_stop_properly_penalty_boundary_coefs():
 
     config = RewardShapingConfig(enabled=True, stop_properly_penalty_coef=0.0)
     result = apply_reward_shaping(batch, config)
-    assert torch.allclose(result["total_reward"], torch.tensor([0.0, 0.0]), atol=1e-6)
+    assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]), atol=1e-6)
 
-    # Test coef=1: no penalty applied
+    # Test coef=1: subtract 1.0 from each truncated reward
     batch["total_reward"] = torch.tensor([1.0, 0.5])
     config["stop_properly_penalty_coef"] = 1.0
     result = apply_reward_shaping(batch, config)
-    assert torch.allclose(result["total_reward"], torch.tensor([1.0, 0.5]), atol=1e-6)
+    assert torch.allclose(result["total_reward"], torch.tensor([0.0, -0.5]), atol=1e-6)
 
 
 def test_stop_properly_penalty_error_cases():
-    """Test error handling for invalid coef and missing truncated field."""
+    """Test error handling for invalid config (missing truncated field)."""
     batch = create_mock_batch_with_responses(
         num_samples=2, response_lengths=[10, 20], initial_rewards=[1.0, 0.5]
     )
@@ -395,12 +394,98 @@ def test_stop_properly_penalty_error_cases():
     with pytest.raises(AssertionError, match="truncated field not found"):
         apply_reward_shaping(batch, config)
 
-    # Invalid coef values
-    batch["truncated"] = torch.tensor([False, True])
-    config["stop_properly_penalty_coef"] = -0.1
-    with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
-        apply_reward_shaping(batch, config)
 
-    config["stop_properly_penalty_coef"] = 1.5
-    with pytest.raises(AssertionError, match="stop_properly_penalty_coef must be in"):
-        apply_reward_shaping(batch, config)
+def test_n_gram_repetition_penalty_short_sequence():
+    """N-gram penalty is zero when sequence is shorter than n."""
+    token_ids = torch.tensor([1, 2, 3])
+    penalty = _compute_n_gram_repetition_penalty(token_ids, n=5, threshold=5)
+    assert penalty == 0.0
+
+
+def test_n_gram_repetition_penalty_no_repeats():
+    """N-gram penalty is zero when no n-grams are over-repeated."""
+    token_ids = torch.arange(20, dtype=torch.long)  # all distinct tokens
+    penalty = _compute_n_gram_repetition_penalty(token_ids, n=5, threshold=2)
+    assert penalty == 0.0
+
+
+def test_n_gram_repetition_penalty_all_same():
+    """Penalty for a sequence of identical tokens."""
+    token_ids = torch.ones(8, dtype=torch.long)
+    penalty = _compute_n_gram_repetition_penalty(token_ids, n=5, threshold=2)
+    # total_n_grams = 4, one unique over-repeated 5-gram, freq=4
+    # fraction_over = 1/4 = 0.25, normalized_max = 4/(8/5) = 2.5
+    # penalty = max(0.25, 2.5) = 2.5
+    assert abs(penalty - 2.5) < 1e-6
+
+
+def test_n_gram_repetition_penalty_high_threshold():
+    """N-gram penalty is zero when threshold exceeds all frequencies."""
+    token_ids = torch.tensor([1, 2, 3, 4, 5, 1, 2, 3, 4, 5], dtype=torch.long)
+    penalty = _compute_n_gram_repetition_penalty(token_ids, n=5, threshold=10)
+    assert penalty == 0.0
+
+
+def test_n_gram_penalty_integration():
+    """Test N-gram penalty applied via apply_reward_shaping."""
+    # Create a batch with a repetitive response
+    batch = create_mock_batch_with_responses(
+        num_samples=2,
+        response_lengths=[10, 10],
+        initial_rewards=[1.0, 0.5],
+    )
+    # Make the first response repetitive (all same tokens)
+    batch["message_log"][0][1]["token_ids"] = torch.ones(10, dtype=torch.long)
+
+    original_rewards = batch["total_reward"].clone()
+
+    config = RewardShapingConfig(
+        enabled=True,
+        n_gram_size=5,
+        n_gram_threshold=2,
+        n_gram_repetition_weight=0.5,
+    )
+    result_batch = apply_reward_shaping(batch, config)
+
+    # First sample: repetitive, should get penalty
+    # Second sample: non-repetitive (arange), should get 0 penalty
+    assert result_batch["total_reward"][0] < original_rewards[0]
+    assert torch.allclose(result_batch["total_reward"][1], original_rewards[1])
+
+
+def test_n_gram_and_dapo_combined():
+    """Test N-gram and DAPO penalties applied together."""
+    batch = create_mock_batch_with_responses(
+        num_samples=1,
+        response_lengths=[30],
+        initial_rewards=[1.0],
+    )
+    # Make response repetitive
+    batch["message_log"][0][1]["token_ids"] = torch.ones(30, dtype=torch.long)
+
+    config = RewardShapingConfig(
+        enabled=True,
+        n_gram_size=5,
+        n_gram_threshold=2,
+        n_gram_repetition_weight=0.3,
+        overlong_buffer_length=5,
+        overlong_buffer_penalty=1.0,
+        max_response_length=25,
+    )
+    result_batch = apply_reward_shaping(batch, config)
+
+    # Both penalties should be applied; reward should decrease
+    assert result_batch["total_reward"][0] < 1.0
+
+
+def test_n_gram_disabled_by_default():
+    """Test that N-gram penalty is skipped when not configured."""
+    batch = create_mock_batch_with_responses(
+        num_samples=1, response_lengths=[20], initial_rewards=[1.0]
+    )
+    original_rewards = batch["total_reward"].clone()
+
+    config = RewardShapingConfig(enabled=True)
+    result_batch = apply_reward_shaping(batch, config)
+
+    assert torch.allclose(result_batch["total_reward"], original_rewards)

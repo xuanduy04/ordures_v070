@@ -3769,6 +3769,10 @@ def async_grpo_train(
                     del initial_prompt_message_logs
                     del prompt_batched_flat
 
+                    if master_config["grpo"]["reward_shaping"]["enabled"]:
+                        repeated_batch = apply_reward_shaping(
+                            repeated_batch, master_config["grpo"]["reward_shaping"]
+                        )
                     rewards = repeated_batch["total_reward"]
 
                     print(
