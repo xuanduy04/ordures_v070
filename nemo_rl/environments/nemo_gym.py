@@ -235,6 +235,22 @@ Depending on your data shape, you may want to change these values."""
             "`rollout_max_attempts_to_avoid_lp_nan` must be at least 1"
         )
 
+        from logging import Filter as LoggingFilter
+        from logging import LogRecord, getLogger
+
+        class No200Filter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                msg = record.getMessage().strip()
+                return not msg.endswith("200") and not msg.endswith("200 OK")
+
+        class NoEmptyFilter(LoggingFilter):
+            def filter(self, record: LogRecord) -> bool:
+                return bool(record.getMessage().strip())
+
+        uvicorn_access_logger = getLogger("uvicorn.access")
+        uvicorn_access_logger.addFilter(No200Filter())
+        uvicorn_access_logger.addFilter(NoEmptyFilter())
+
         self.rh = RunHelper()
         self.rh.start(
             global_config_dict_parser_config=GlobalConfigDictParserConfig(
