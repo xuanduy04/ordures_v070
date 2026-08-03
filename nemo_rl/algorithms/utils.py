@@ -126,6 +126,8 @@ def calculate_baseline_and_std_per_prompt(
     Returns:
     tensor (b,), tensor (b,) of baselines and std on the same device as 'rewards'
     """
+    valid_mask = valid_mask * torch.isfinite(rewards)
+    rewards = rewards.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
     if std_rewards is None:
         std_rewards = rewards
     unique_prompts = torch.unique(prompts, dim=0)
@@ -183,7 +185,7 @@ def calculate_baseline_and_std_per_prompt(
                 / num_valid
             )
 
-            baseline[prompt_idx] = prompt_baseline
+            baseline[prompt_idx] = prompt_baseline.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
             sq_baseline[prompt_idx] = std_prompt_baseline_square
             std[prompt_idx] = (
                 (
@@ -191,7 +193,7 @@ def calculate_baseline_and_std_per_prompt(
                     * (num_valid / (num_valid - 1))
                 )
                 .sqrt()
-                .nan_to_num(0)
+                .nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)
             )
 
     return baseline, std

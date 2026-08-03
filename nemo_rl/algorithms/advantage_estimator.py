@@ -566,7 +566,10 @@ class OPDAdvantageEstimator:
         distill_advantages = (teacher_logprobs - prev_logprobs).detach()
 
         # Apply mask
-        advantages = distill_advantages * mask
+        advantages = torch.nan_to_num(
+            distill_advantages * mask,
+            nan=0.0, posinf=0.0, neginf=0.0
+        )
 
         # Metrics
         self._compute_metrics(distill_advantages, advantages, mask)
