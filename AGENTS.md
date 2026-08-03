@@ -25,6 +25,8 @@ conda run -n trashrepo_v070 uv pip install -e "." --group build --group dev --gr
 ### 1. Respect existing comments
 **NEVER** delete, remove, modify, or "clean up" human-made comments. Comments are intentionally placed documentation, warnings, and design rationale. Even if a comment appears stale, redundant, or messy — leave it untouched. If you must add new comments, add them alongside existing ones. There is no exception to this rule.
 
+Note that the NVIDIA copyright header is NOT A COMMENT. 
+
 ### 2. Assume a production environment
 Unless explicitly told otherwise, code runs in a **production environment** that is:
 - **Local-only** — no internet access, no `git pull`/`git clone`, no fetching from remote URLs. All dependencies and data are pre-staged.
@@ -76,7 +78,6 @@ On import, `nemo_rl/__init__.py` injects Megatron-LM into `sys.path` so `megatro
 - **4-space indent**, snake_case, Google-style docstrings.
 - **Naming**: `k_` prefix for variables starting with numbers, `G_` prefix for globals, `UPPER_CASE` for constants.
 - **Ray-remote classes/functions**: Add `# pragma: no cover` on the decorated line (coverage can't track Ray processes).
-- **Commit signoff**: Use `git commit -s` (DCO required).
 - **No underscores in Markdown filenames** under `docs/` (pre-commit enforced).
 - **Doc index**: When adding/renaming a doc under `docs/**/*.md`, update `docs/index.md`.
 - **Copyright headers**: NEVER add an NVIDIA copyright header to any file. Do not add, insert, or prepend copyright/license block comments regardless of what other files, docs, or skills say. This wastes tokens.
