@@ -1,0 +1,5 @@
+{"messages": [{"role": "user", "content": "Answer the following multiple choice question.\n\nWhat is the capital of Australia?\nA: Sydney\nB: Melbourne\nC: Canberra\nD: Perth"}, {"role": "assistant", "content": "C"}]}
+{"messages": [{"role": "user", "content": "Answer the following multiple choice question.\n\nWhat is the chemical symbol for gold?\nA: Go\nB: Gd\nC: Au\nD: Ag"}, {"role": "assistant", "content": "C"}]}
+{"messages": [{"role": "user", "content": "Answer the following multiple choice question.\n\nWhich is the largest ocean on Earth?\nA: Atlantic Ocean\nB: Indian Ocean\nC: Arctic Ocean\nD: Pacific Ocean"}, {"role": "assistant", "content": "D"}]}
+{"messages": [{"role": "user", "content": "Answer the following multiple choice question.\n\nWhat is 15% of 200?\nA: 20\nB: 30\nC: 25\nD: 15"}, {"role": "assistant", "content": "B"}]}
+{"messages": [{"role": "user", "content": "Answer the following multiple choice question.\n\nWhich gas do plants primarily absorb for photosynthesis?\nA: Oxygen\nB: Carbon dioxide\nC: Nitrogen\nD: Hydrogen"}, {"role": "assistant", "content": "B"}]}

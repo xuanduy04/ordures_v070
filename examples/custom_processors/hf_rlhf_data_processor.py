@@ -42,23 +42,24 @@ def hf_rlhf_data_processor(
 ) -> DatumSpec:
     messages = _normalize_messages(datum_dict.get("messages"))
     principle: str = datum_dict.get("principle", "")
+    ground_truth: str = datum_dict.get("ground_truth", "")
 
     message_log: LLMMessageLogType = []
-    user_message = {
-        "role": "user",
-    }
-    message: list[str] = tokenizer.apply_chat_template(  # type: ignore
+    message = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
         add_generation_prompt=True,
         add_special_tokens=False,
     )
-    user_message["content"] = message
-    user_message["token_ids"] = tokenizer(
-        message,
-        return_tensors="pt",
-        add_special_tokens=False,
-    )["input_ids"][0]
+    user_message = {
+        "role": "user",
+        "content": message,
+        "token_ids": tokenizer(
+            message,  # type: ignore
+            return_tensors="pt",
+            add_special_tokens=False,
+        )["input_ids"][0]
+    }
     
     message_log.append(user_message)
     
@@ -66,13 +67,14 @@ def hf_rlhf_data_processor(
 
     loss_multiplier = 1.0
     if length > max_seq_length:
+        # mask the sample away
         for message in message_log:
             message["token_ids"] = message["token_ids"][
-                : min(4, max_seq_length // len(message_log))
+                : min(4, max_seq_length // (len(message_log) + 67))
             ]
         loss_multiplier = 0.0
 
-    extra_env_info = {"principle": principle}
+    extra_env_info = {"principle": principle, "ground_truth": ground_truth}
 
     output: DatumSpec = {
         "message_log": message_log,
@@ -86,4 +88,4 @@ def hf_rlhf_data_processor(
 
 
 if PROCESSOR_NAME not in PROCESSOR_REGISTRY:
-    register_processor(PROCESSOR_NAME, hf_rlhf_data_processor)
+    register_processor(PROCESSOR_NAME, hf_rlhf_data_processor)  # type: ignore

@@ -1,0 +1,5 @@
+{"messages": [{"role": "user", "content": "What is 17 * 23?"}, {"role": "assistant", "content": "391"}]}
+{"messages": [{"role": "user", "content": "Who wrote the play 'Hamlet'?"}, {"role": "assistant", "content": "William Shakespeare"}]}
+{"messages": [{"role": "user", "content": "What is the chemical formula of water?"}, {"role": "assistant", "content": "H2O"}]}
+{"messages": [{"role": "user", "content": "What is the square root of 169?"}, {"role": "assistant", "content": "13"}]}
+{"messages": [{"role": "user", "content": "In which year did the Berlin Wall fall?"}, {"role": "assistant", "content": "1989"}]}
